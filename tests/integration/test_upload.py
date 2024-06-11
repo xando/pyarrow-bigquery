@@ -6,7 +6,8 @@ import pyarrow as pa
 import pyarrow.bigquery as bq
 
 
-LOCATION = f"{os.environ['GCP_PROJECT']}.test.{uuid.uuid4()}"
+PROJECT = os.environ['GCP_PROJECT']
+LOCATION = f"{PROJECT}.test.{uuid.uuid4()}"
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +28,22 @@ def test_simple():
 
     assert table_back.schema == table.schema
     assert table_back.sort_by("test").equals(table.sort_by("test"))
+
+
+def test_reader_query():
+    table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
+
+    bq.write_table(table, LOCATION, table_create=True)
+
+    query = f'SELECT * FROM `{LOCATION}`'
+    table_back1 = pa.concat_tables([t for t in bq.reader_query(project=PROJECT, query=query)])
+
+    table_back2 = bq.read_query(project=PROJECT, query=query)
+
+    assert table_back1.schema == table_back2.schema == table.schema
+
+    assert table_back1.sort_by("test").equals(table.sort_by("test"))
+    assert table_back2.sort_by("test").equals(table.sort_by("test"))
 
 
 def test_context():

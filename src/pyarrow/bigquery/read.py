@@ -7,6 +7,7 @@ import threading
 import shutil
 
 from google.cloud import bigquery_storage
+from google.cloud import bigquery
 
 import pyarrow as pa
 import pyarrow.feather as fa
@@ -154,6 +155,28 @@ def reader(
         logger.debug(f"Time taken to read: {time.time()-t0:.2f}")
 
 
+def reader_query(
+    project: str,
+    query: str,
+    *,
+    worker_count: int = multiprocessing.cpu_count(),
+    worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+    batch_size: int = 100,
+):
+    client = bigquery.Client(project=project)
+    job = client.query(query)
+    job.result()
+
+    source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"
+    return reader(
+        source=source,
+        project=project,
+        worker_count=worker_count,
+        worker_type=worker_type,
+        batch_size=batch_size,
+    )
+
+
 def read_table(
     source: str,
     *,
@@ -173,5 +196,23 @@ def read_table(
             worker_count=worker_count,
             worker_type=worker_type,
             batch_size=batch_size,
+        )
+    )
+
+def read_query(
+    project: str,
+    query: str,
+    *,
+    worker_count: int = multiprocessing.cpu_count(),
+    worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+    batch_size: int = 100,
+):
+    return pa.concat_tables(
+        reader_query(
+            project=project,
+            query=query,
+            worker_count=worker_count,
+            worker_type=worker_type,
+            batch_size=batch_size
         )
     )
