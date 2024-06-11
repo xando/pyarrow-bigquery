@@ -1,4 +1,3 @@
-import pytest
 import pyarrow as pa
 from pyarrow.bigquery.write.pa_to_pb import ammend_schema
 
