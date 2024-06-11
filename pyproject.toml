@@ -1,0 +1,36 @@
+[project]
+name = "pyarrow-bigquery"
+version = "0.1.0"
+description = "A simple library to **write to** and **download from** BigQuery tables as PyArrow tables."
+authors = [{ name = "Sebastian Pawluś", email = "sebastian.pawlus@gmail.com" }]
+readme = "README.md"
+keywords = ["pyarrow", "bigquery"]
+
+dependencies = [
+    "google-cloud-bigquery>=3,<5",
+    "google-cloud-bigquery-storage>=2,<3",
+    "pyarrow>=16,<17",
+    "protobuf>=4,<5"
+]
+
+[project.license]
+text = "MIT"
+
+[build-system]
+requires = ["setuptools>=40.6.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src/"]
+include = ["pyarrow.bigquery*"]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow.*"]
+ignore_missing_imports = true
+
+
+[tool.ruff]
+exclude = [".git"]
+
+line-length = 120
+indent-width = 4
