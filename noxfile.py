@@ -6,5 +6,6 @@ def lint(session):
     session.install("pytest")
     session.install("ruff")
     session.install(".")
+
     session.run("ruff check")
     session.run("pytest")
