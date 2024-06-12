@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["master"]
 
+env:
+  GCP_PROJECT: $GCP_PROJECT
+
 jobs:
   build:
 
