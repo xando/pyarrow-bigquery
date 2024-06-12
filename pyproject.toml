@@ -1,7 +1,7 @@
 [project]
 name = "pyarrow-bigquery"
 version = "0.1.0"
-description = "A simple library to **write to** and **download from** BigQuery tables as PyArrow tables."
+description = "A simple library to write to and read from BigQuery tables as PyArrow tables."
 authors = [{ name = "Sebastian Pawluś", email = "sebastian.pawlus@gmail.com" }]
 readme = "README.md"
 keywords = ["pyarrow", "bigquery"]
