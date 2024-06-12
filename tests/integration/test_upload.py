@@ -5,14 +5,17 @@ import os
 import pyarrow as pa
 import pyarrow.bigquery as bq
 
-print(os.environ)
 
 PROJECT = os.environ['GCP_PROJECT']
-LOCATION = f"{PROJECT}.test.{uuid.uuid4()}"
 
 
-@pytest.fixture(autouse=True)
-def _remove_table():
+@pytest.fixture(scope="function")
+def LOCATION():
+    return f"{PROJECT}.test.{uuid.uuid4()}"
+
+
+@pytest.fixture(autouse=True, scope='function')
+def _remove_table(LOCATION):
     from google.cloud import bigquery
 
     bigquery.Client(project="xando-1-main").delete_table(LOCATION, not_found_ok=True)
@@ -20,7 +23,7 @@ def _remove_table():
     bigquery.Client(project="xando-1-main").delete_table(LOCATION, not_found_ok=True)
 
 
-def test_simple():
+def test_simple(LOCATION):
     table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
 
     bq.write_table(table, LOCATION, table_create=True)
@@ -31,7 +34,7 @@ def test_simple():
     assert table_back.sort_by("test").equals(table.sort_by("test"))
 
 
-def test_reader_query():
+def test_reader_query(LOCATION):
     table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
 
     bq.write_table(table, LOCATION, table_create=True)
@@ -47,7 +50,7 @@ def test_reader_query():
     assert table_back2.sort_by("test").equals(table.sort_by("test"))
 
 
-def test_context():
+def test_context(LOCATION):
     table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
 
     with bq.writer(table.schema, LOCATION, table_create=True) as w:
@@ -59,7 +62,7 @@ def test_context():
     assert table_back.sort_by("test").equals(table.sort_by("test"))
 
 
-def test_complex():
+def test_complex(LOCATION):
     _1d_int = pa.array([1, 2])
     _2d_int = pa.array([[1, 2, 3], [4, 5, 6]])
     _3d_int = pa.array(

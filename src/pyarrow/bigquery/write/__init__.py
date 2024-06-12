@@ -44,8 +44,6 @@ def _bq_create_table(*, project, location, schema, expire, overwrite):
 
     client.create_table(table)
 
-    print(client.get_table(location))
-
     if expire:
         table.expires = datetime.datetime.now() + datetime.timedelta(seconds=expire)
         client.update_table(table, ["expires"])
