@@ -18,9 +18,9 @@ def LOCATION():
 def _remove_table(LOCATION):
     from google.cloud import bigquery
 
-    bigquery.Client(project="xando-1-main").delete_table(LOCATION, not_found_ok=True)
+    bigquery.Client(project=PROJECT).delete_table(LOCATION, not_found_ok=True)
     yield
-    bigquery.Client(project="xando-1-main").delete_table(LOCATION, not_found_ok=True)
+    bigquery.Client(project=PROJECT).delete_table(LOCATION, not_found_ok=True)
 
 
 def test_simple(LOCATION):
