@@ -7,7 +7,7 @@ import pyarrow.bigquery as bq
 
 print(os.environ)
 
-PROJECT = os.environ['env.GCP_PROJECT']
+PROJECT = os.environ['GCP_PROJECT']
 LOCATION = f"{PROJECT}.test.{uuid.uuid4()}"
 
 

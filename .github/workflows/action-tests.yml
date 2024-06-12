@@ -7,7 +7,7 @@ on:
     branches: ["master"]
 
 env:
-  GCP_PROJECT: ${{ env.GCP_PROJECT }}
+  GCP_PROJECT: ${{ GCP_PROJECT }}
 
 jobs:
   build:
