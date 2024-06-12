@@ -20,10 +20,17 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v3
       with:
         python-version: ${{ matrix.python-version }}
+
+    - name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v2'
+      with:
+        credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'\
+
     - name: Install dependencies
       run: |
         env
@@ -31,9 +38,11 @@ jobs:
         python -m pip install .
         python -m pip install pytest
         python -m pip install ruff
+
     - name: Lint with ruff
       run: |
         ruff check
+
     - name: Test with pytest
       run: |
         pytest
