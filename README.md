@@ -2,6 +2,7 @@
 
 A simple library to **write to** and **download from** BigQuery tables as PyArrow tables.
 
+
 ## Installation 
 
 ```bash 
@@ -12,11 +13,11 @@ pip install pyarrow-bigquery
 
 This guide will help you quickly get started with `pyarrow-bigquery`, a library that allows you to **read** from and **write** to Google BigQuery using PyArrow.
 
-### Reading from BigQuery
+### Reading
 
 `pyarrow-bigquery` exposes two methods to read BigQuery tables as PyArrow tables. Depending on your use case or the size of the table, you might want to use one method over the other.
 
-#### Read the Whole Table
+**Read the Whole Table**
 
 When the table is small enough to fit in memory, you can read it directly using `bq.read_table`.
 
@@ -28,7 +29,7 @@ table = bq.read_table("gcp_project.dataset.small_table")
 print(table.num_rows)
 ```
 
-#### Read with Batches
+**Read with Batches**
 
 If the target table is larger than memory or you have other reasons not to fetch the whole table at once, you can use the `bq.reader` iterator method along with the `batch_size` parameter to limit how much data is fetched per iteration.
 
@@ -39,11 +40,11 @@ for table in bq.reader("gcp_project.dataset.big_table", batch_size=100):
     print(table.num_rows)
 ```
 
-### Writing to BigQuery
+### Writing
 
 Similarly, the package exposes two methods to write to BigQuery. Depending on your use case or the size of the table, you might want to use one method over the other.
 
-#### Write the Whole Table
+**Write the Whole Table**
 
 When you want to write a complete table at once, you can use the `bq.write_table` method.
 
@@ -56,7 +57,7 @@ table = pa.Table.from_arrays([[1, 2, 3, 4]], names=['integers'])
 bq.write_table(table, 'gcp_project.dataset.table')
 ```
 
-#### Write in Batches (Smaller Chunks)
+**Write in Batches (Smaller Chunks)**
 
 If you need to write data in smaller chunks, you can use the `bq.writer` method with the `schema` parameter to define the table structure.
 
@@ -75,7 +76,7 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as w:
 
 ## API Reference
 
-### `pyarrow.bigquery.write_table`
+#### `pyarrow.bigquery.write_table`
 
 Write a PyArrow Table to a BigQuery Table. No return value.
 
@@ -112,7 +113,7 @@ Write a PyArrow Table to a BigQuery Table. No return value.
 bq.write_table(table, 'gcp_project.dataset.table')
 ```
 
-### `pyarrow.bigquery.writer`
+#### `pyarrow.bigquery.writer`
 
 Context manager version of the write method. Useful when the PyArrow table is larger than memory size or the table is available in chunks.
 
@@ -187,7 +188,7 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as w:
         w.write_batch(pa.RecordBatch.from_pylist([{'value': [1] * 10}]))
 ```
 
-### `pyarrow.bigquery.read_table`
+#### `pyarrow.bigquery.read_table`
 
 **Parameters:**
 
@@ -212,7 +213,7 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as w:
 - `batch_size`: `int`, *default* `100`  
   Batch size used for fetching. Table will be automatically split to this value.
 
-### `pyarrow.bigquery.reader`
+#### `pyarrow.bigquery.reader`
 
 **Parameters:**
 
