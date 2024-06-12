@@ -3,11 +3,17 @@
 A simple library to **write to** and **download from** BigQuery tables as PyArrow tables.
 
 
+---
+
+
 ## Installation 
 
 ```bash 
 pip install pyarrow-bigquery
 ```
+
+
+---
 
 ## Quick Start
 
@@ -74,7 +80,12 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as w:
     w.write_table(table)
 ```
 
+
+---
+
 ## API Reference
+
+### Writing
 
 #### `pyarrow.bigquery.write_table`
 
@@ -113,7 +124,7 @@ Write a PyArrow Table to a BigQuery Table. No return value.
 bq.write_table(table, 'gcp_project.dataset.table')
 ```
 
-#### `pyarrow.bigquery.writer`
+#### `pyarrow.bigquery.writer` (Context manager)
 
 Context manager version of the write method. Useful when the PyArrow table is larger than memory size or the table is available in chunks.
 
@@ -148,7 +159,7 @@ Context manager version of the write method. Useful when the PyArrow table is la
 
 Depending on the use case, you might want to use one of the methods below to write your data to a BigQuery table, using either `pa.Table` or `pa.RecordBatch`.
 
-#### `pyarrow.bigquery.writer.write_table`
+#### `pyarrow.bigquery.writer.write_table` (Context Manager Method)
 
 Context manager method to write a table.
 
@@ -168,7 +179,7 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as w:
         w.write_table(pa.Table.from_pylist([{'value': [a] * 10}]))
 ```
 
-#### `pyarrow.bigquery.writer.write_batch`
+#### `pyarrow.bigquery.writer.write_batch` (Context Manager Method)
 
 Context manager method to write a record batch.
 
@@ -187,6 +198,8 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as w:
     for a in range(1000):
         w.write_batch(pa.RecordBatch.from_pylist([{'value': [1] * 10}]))
 ```
+
+### Reading
 
 #### `pyarrow.bigquery.read_table`
 
@@ -212,6 +225,28 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as w:
 
 - `batch_size`: `int`, *default* `100`  
   Batch size used for fetching. Table will be automatically split to this value.
+
+#### `pyarrow.bigquery.read_query`
+
+**Parameters:**
+- `project`: `str`  
+  BigQuery query execution (and billing project).
+
+- `query`: `str`  
+  Query to be executed
+
+- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
+  Worker backend for fetching data.
+
+- `worker_count`: `int`, *default* `os.cpu_count()`  
+  Number of threads or processes to use for fetching data from BigQuery.
+
+- `batch_size`: `int`, *default* `100`  
+  Batch size used for fetching. Table will be automatically split to this value.
+
+```python
+table = bq.read_query("gcp_project", "SELECT * FROM `gcp_project.dataset.table`")
+```
 
 #### `pyarrow.bigquery.reader`
 
@@ -247,4 +282,28 @@ for part in bq.reader("gcp_project.dataset.table"):
     parts.append(part)
 
 table = pa.concat_tables(parts)
+```
+
+
+#### `pyarrow.bigquery.reader_query`
+
+**Parameters:**
+- `project`: `str`  
+  BigQuery query execution (and billing project).
+
+- `query`: `str`  
+  Query to be executed
+
+- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
+  Worker backend for fetching data.
+
+- `worker_count`: `int`, *default* `os.cpu_count()`  
+  Number of threads or processes to use for fetching data from BigQuery.
+
+- `batch_size`: `int`, *default* `100`  
+  Batch size used for fetching. Table will be automatically split to this value.
+
+```python
+for batch in bq.reader_query("gcp_project", "SELECT * FROM `gcp_project.dataset.table`"):
+    print(batch.num_rows)
 ```
