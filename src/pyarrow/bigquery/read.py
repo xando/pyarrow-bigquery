@@ -213,6 +213,7 @@ def read_table(
         )
     )
 
+
 def read_query(
     project: str,
     query: str,
@@ -223,10 +224,6 @@ def read_query(
 ):
     return pa.concat_tables(
         reader_query(
-            project=project,
-            query=query,
-            worker_count=worker_count,
-            worker_type=worker_type,
-            batch_size=batch_size
+            project=project, query=query, worker_count=worker_count, worker_type=worker_type, batch_size=batch_size
         )
     )
