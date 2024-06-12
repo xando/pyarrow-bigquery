@@ -10,6 +10,7 @@ import shutil
 
 from google.cloud import bigquery_storage
 from google.cloud import bigquery
+from google.cloud.exceptions import NotFound
 
 import pyarrow as pa
 import pyarrow.feather as fa
@@ -23,8 +24,18 @@ logger = logging.getLogger(__name__)
 # NOTE: This is required for the multiprocessing to correcly serialize the worker arguments
 multiprocessing.set_start_method("fork")
 
+def _bq_table_exists(project: str, location: str):
+    client = bigquery.Client(project=project)
 
-def _generate_streams(
+    try:
+        client.get_table(location)
+        logger.debug(f"Table {location} already exists")
+    except NotFound as e:
+        logger.debug("Table {location} is not found")
+        raise e
+
+
+def _bq_read_create_strems(
     read_client: bigquery_storage.BigQueryReadClient,
     parent: str,
     location: str,
@@ -55,7 +66,7 @@ def _generate_streams(
     return read_session.streams, schema
 
 
-def _read_streams(read_client, read_streams, table_schema, batch_size, queue_results, temp_dir):
+def _stream_worker(read_client, read_streams, table_schema, batch_size, queue_results, temp_dir):
     batches = []
 
     for stream in read_streams:
@@ -63,6 +74,7 @@ def _read_streams(read_client, read_streams, table_schema, batch_size, queue_res
 
         for message in read_client.read_rows(stream.name):
             record_batch = pa.ipc.read_record_batch(message.arrow_record_batch.serialized_record_batch, table_schema)
+
             batches.append(record_batch)
 
             if sum(b.num_rows for b in batches) >= batch_size:
@@ -104,7 +116,9 @@ def reader(
     queue_results = multiprocessing.Queue()
     read_client = bigquery_storage.BigQueryReadClient()
 
-    streams, streams_schema = _generate_streams(
+    _bq_table_exists(project, source)
+
+    streams, streams_schema = _bq_read_create_strems(
         read_client=read_client,
         parent=project,
         location=source,
@@ -114,7 +128,7 @@ def reader(
     )
     workers_done = 0
 
-    assert streams, "No streams to read"
+    assert streams, "No streams to read, Table might be empty"
 
     logger.debug(f"Number of workers: {worker_count}, number of streams: {len(streams)}")
 
@@ -127,7 +141,7 @@ def reader(
     try:
         for streams in some_itertools.to_split(streams, actual_worker_count):
             e = worker_type(
-                target=_read_streams,
+                target=_stream_worker,
                 args=(
                     read_client,
                     streams,

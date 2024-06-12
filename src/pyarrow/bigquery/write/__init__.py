@@ -53,7 +53,7 @@ def _bq_create_table(*, project, location, schema, expire, overwrite):
     logger.debug(f"Created BigQuery table '{location}'")
 
 
-def _bq_storage_create_stream(write_client: bigquery_storage_v1.BigQueryWriteClient, parent, protobuf_definition):
+def _bq_write_create_stream(write_client: bigquery_storage_v1.BigQueryWriteClient, parent, protobuf_definition):
     write_stream = write_client.create_write_stream(
         parent=parent,
         write_stream=bigquery_storage_v1.types.WriteStream(type=bigquery_storage_v1.types.WriteStream.Type.PENDING),
@@ -99,7 +99,7 @@ def _stream_worker(
     schema_protobuf,
     queue_results,
 ):
-    stream = _bq_storage_create_stream(write_client, parent, schema_protobuf)
+    stream = _bq_write_create_stream(write_client, parent, schema_protobuf)
 
     offset = 0
 
