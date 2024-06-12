@@ -21,9 +21,6 @@ from . import some_itertools
 logger = logging.getLogger(__name__)
 
 
-# NOTE: This is required for the multiprocessing to correcly serialize the worker arguments
-multiprocessing.set_start_method("fork")
-
 def _bq_table_exists(project: str, location: str):
     client = bigquery.Client(project=project)
 
