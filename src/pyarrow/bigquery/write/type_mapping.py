@@ -16,6 +16,7 @@ TYPES_MAPPING = {
     pa.types.is_floating: TypeMapping(bigquery.SqlTypeNames.FLOAT64, FieldDescriptorProto.TYPE_DOUBLE),
     pa.types.is_integer: TypeMapping(bigquery.SqlTypeNames.INT64, FieldDescriptorProto.TYPE_INT64),
     pa.types.is_string: TypeMapping(bigquery.SqlTypeNames.STRING, FieldDescriptorProto.TYPE_STRING),
+    pa.types.is_large_string: TypeMapping(bigquery.SqlTypeNames.STRING, FieldDescriptorProto.TYPE_STRING),
     pa.types.is_time: TypeMapping(bigquery.SqlTypeNames.TIME, FieldDescriptorProto.TYPE_STRING),
     pa.types.is_timestamp: TypeMapping(bigquery.SqlTypeNames.TIMESTAMP, FieldDescriptorProto.TYPE_STRING),
 }
