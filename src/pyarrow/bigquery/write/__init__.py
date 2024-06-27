@@ -206,7 +206,7 @@ class writer:
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-        logger.debug(f"Time taken: {time.time() - self.t0}")
+        logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
 
 def write_table(

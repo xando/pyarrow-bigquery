@@ -40,7 +40,9 @@ def test_reader_query(LOCATION):
     bq.write_table(table, LOCATION, table_create=True)
 
     query = f'SELECT * FROM `{LOCATION}`'
-    table_back1 = pa.concat_tables([t for t in bq.reader_query(project=PROJECT, query=query)])
+
+    with bq.reader_query(project=PROJECT, query=query) as r:
+        table_back1 = pa.concat_tables(r)
 
     table_back2 = bq.read_query(project=PROJECT, query=query)
 
@@ -56,7 +58,8 @@ def test_context(LOCATION):
     with bq.writer(table.schema, LOCATION, table_create=True) as w:
         w.write_table(table)
 
-    table_back = pa.concat_tables([t for t in bq.reader(LOCATION)])
+    with bq.reader(LOCATION) as r:
+        table_back = pa.concat_tables(r)
 
     assert table_back.schema == table.schema
     assert table_back.sort_by("test").equals(table.sort_by("test"))

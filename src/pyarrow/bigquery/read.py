@@ -94,79 +94,98 @@ def _stream_worker(read_client, read_streams, table_schema, batch_size, queue_re
     queue_results.put(None)
 
 
-def reader(
-    source: str,
-    *,
-    project: str | None = None,
-    columns: list | None = None,
-    row_restrictions: str | None = None,
-    worker_count: int = multiprocessing.cpu_count(),
-    worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
-    batch_size: int = 100,
-):
-    t0 = time.time()
-    project_id, *_ = source.split(".")
+class reader:
+    def __init__(
+        self,
+        source: str,
+        *,
+        project: str | None = None,
+        columns: list | None = None,
+        row_restrictions: str | None = None,
+        worker_count: int = multiprocessing.cpu_count(),
+        worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+        batch_size: int = 100,
+    ):
+        self.source = source
+        self.project = project
+        self.columns = columns
+        self.row_restrictions = row_restrictions
+        self.worker_count = worker_count
+        self.worker_type = worker_type
+        self.batch_size = batch_size
 
-    if not project:
-        project = project_id
+        project_id, *_ = source.split(".")
 
-    queue_results = multiprocessing.Queue()
-    read_client = bigquery_storage.BigQueryReadClient()
+        if not project:
+            self.project = project_id
 
-    _bq_table_exists(project, source)
+    def __enter__(self):
+        self.t0 = time.time()
 
-    streams, streams_schema = _bq_read_create_strems(
-        read_client=read_client,
-        parent=project,
-        location=source,
-        selected_fields=columns,
-        row_restrictions=row_restrictions,
-        max_stream_count=worker_count * 3,
-    )
-    workers_done = 0
+        self.queue_results = multiprocessing.Queue()
+        self.read_client = bigquery_storage.BigQueryReadClient()
+        self.temp_dir = tempfile.mkdtemp()
+        self.workers = []
 
-    assert streams, "No streams to read, Table might be empty"
+        _bq_table_exists(self.project, self.source)
 
-    logger.debug(f"Number of workers: {worker_count}, number of streams: {len(streams)}")
+        self.streams, self.schema = _bq_read_create_strems(
+            read_client=self.read_client,
+            parent=self.project,
+            location=self.source,
+            selected_fields=self.columns,
+            row_restrictions=self.row_restrictions,
+            max_stream_count=self.worker_count * 3,
+        )
+        self.workers_done = 0
 
-    actual_worker_count = min(worker_count, len(streams))
+        assert self.streams, "No streams to read, Table might be empty"
 
-    logger.debug(f"Actual worker count: {actual_worker_count}")
+        self.actual_worker_count = min(self.worker_count, len(self.streams))
 
-    temp_dir = tempfile.mkdtemp()
+        logger.debug(f"Number of workers: {self.worker_count}, number of streams: {len(self.streams)}")
+        logger.debug(f"Actual worker count: {self.actual_worker_count}")
 
-    try:
-        for streams in some_itertools.to_split(streams, actual_worker_count):
-            e = worker_type(
+        for worker_streams in some_itertools.to_split(self.streams, self.actual_worker_count):
+            worker = self.worker_type(
                 target=_stream_worker,
                 args=(
-                    read_client,
-                    streams,
-                    streams_schema,
-                    batch_size,
-                    queue_results,
-                    temp_dir,
+                    self.read_client,
+                    worker_streams,
+                    self.schema,
+                    self.batch_size,
+                    self.queue_results,
+                    self.temp_dir,
                 ),
             )
-            e.start()
+            worker.start()
+            self.workers.append(worker)
 
-        while True:
-            element = queue_results.get()
+        return self
 
-            if not element:
-                workers_done += 1
+    def __exit__(self, *_, **__):
+        for w in self.workers:
+            w.join()
 
-                if workers_done == actual_worker_count:
-                    break
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        logger.debug(f"Time taken: {time.time()-self.t0:.2f}")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        element = self.queue_results.get()
+        if not element:
+            self.workers_done += 1
+
+            if self.workers_done == self.actual_worker_count:
+                raise StopIteration
             else:
-                table = fa.read_table(element)
-                os.remove(element)
-                yield table
-    finally:
-        t = time.time()
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        logger.debug(f"Time to cleanup temp directory: {time.time()-t:.2f}")
-        logger.debug(f"Time taken to read: {time.time()-t0:.2f}")
+                return self.__next__()
+        else:
+            table = fa.read_table(element)
+            os.remove(element)
+            return table
 
 
 def reader_query(
@@ -182,6 +201,7 @@ def reader_query(
     job.result()
 
     source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"
+
     return reader(
         source=source,
         project=project,
@@ -201,17 +221,16 @@ def read_table(
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     batch_size: int = 100,
 ):
-    return pa.concat_tables(
-        reader(
-            source=source,
-            project=project,
-            columns=columns,
-            row_restrictions=row_restrictions,
-            worker_count=worker_count,
-            worker_type=worker_type,
-            batch_size=batch_size,
-        )
-    )
+    with reader(
+        source=source,
+        project=project,
+        columns=columns,
+        row_restrictions=row_restrictions,
+        worker_count=worker_count,
+        worker_type=worker_type,
+        batch_size=batch_size,
+    ) as r:
+        return pa.concat_tables(r)
 
 
 def read_query(
@@ -222,8 +241,7 @@ def read_query(
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     batch_size: int = 100,
 ):
-    return pa.concat_tables(
-        reader_query(
-            project=project, query=query, worker_count=worker_count, worker_type=worker_type, batch_size=batch_size
-        )
-    )
+    with reader_query(
+        project=project, query=query, worker_count=worker_count, worker_type=worker_type, batch_size=batch_size
+    ) as r:
+        return pa.concat_tables(r)
