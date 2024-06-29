@@ -67,11 +67,13 @@ Similarly, you can read data in batches from a query using `reader_query`.
 ```python
 import pyarrow.bigquery as bq
 
-for table in bq.reader_query(
+with bq.reader_query(
     project="gcp_project",
     query="SELECT * FROM `gcp_project.dataset.small_table`"
-):
-    print(table.num_rows)
+) as reader:
+    print(reader.schema)
+    for table in reader:
+        print(table.num_rows)
 ```
 
 ### Writing
@@ -253,6 +255,8 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as writer:
 - `batch_size`: `int`, *default* `100`  
   The batch size used for fetching. The table will be automatically split into this value.
 
+  
+
 #### `pyarrow.bigquery.read_query`
 
 **Parameters:**
@@ -276,13 +280,12 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as writer:
 table = bq.read_query("gcp_project", "SELECT * FROM `gcp_project.dataset.table`")
 ```
 
-#### `pyarrow.bigquery.reader`
+
+#### `pyarrow.bigquery.reader` (Context Manager)
 
 **Parameters:**
 
-- `
-
-source`: `str`  
+- `source`: `str`  
   The BigQuery table location.
 
 - `project`: `str`, *default* `None`  
@@ -303,18 +306,29 @@ source`: `str`
 - `batch_size`: `int`, *default* `100`  
   The batch size used for fetching. The table will be automatically split into this value.
 
+**Attributes:** 
+
+- `schema`: `pa.Schema`   
+  Context manager attribute to provide schema of pyarrow table. Works only when context manager is active (after `__enter__` was called)
+  
+
 ```python
 import pyarrow as pa
 import pyarrow.bigquery as bq
 
 parts = []
-for part in bq.reader("gcp_project.dataset.table"):
-    parts.append(part)
+
+with bq.reader("gcp_project.dataset.table") as r:
+
+    print(r.schema)
+
+    for batch in r:
+        parts.append(batch)
 
 table = pa.concat_tables(parts)
 ```
 
-#### `pyarrow.bigquery.reader_query`
+#### `pyarrow.bigquery.reader_query`  (Context Manager)
 
 **Parameters:**
 
@@ -333,7 +347,15 @@ table = pa.concat_tables(parts)
 - `batch_size`: `int`, *default* `100`  
   The batch size used for fetching. The table will be automatically split into this value.
 
+
+**Attributes:** 
+
+- `schema`: `pa.Schema`   
+  Context manager attribute to provide schema of pyarrow table. Works only when context manager is active (after `__enter__` was called)
+  
+
 ```python
-for batch in bq.reader_query("gcp_project", "SELECT * FROM `gcp_project.dataset.table`"):
-    print(batch.num_rows)
+with bq.reader_query("gcp_project", "SELECT * FROM `gcp_project.dataset.table`") as r:
+    for batch in r:
+        print(batch.num_rows)
 ```
