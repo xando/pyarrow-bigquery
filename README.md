@@ -12,7 +12,9 @@ An extension library to **write** to and **read** from BigQuery tables as PyArro
 pip install pyarrow-bigquery
 ```
 
----
+## Source Code
+
+https://github.com/xando/pyarrow-bigquery/
 
 ## Quick Start
 
