@@ -2,7 +2,7 @@
 
 # pyarrow-bigquery
 
-A simple library to **write to** and **download from** BigQuery tables as PyArrow tables.
+An extension library to **write** to and **read** from BigQuery tables as PyArrow tables.
 
 ---
 
