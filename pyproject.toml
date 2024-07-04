@@ -1,6 +1,6 @@
 [project]
 name = "pyarrow-bigquery"
-version = "0.5.4"
+version = "0.5.5"
 description = "An extension library to write to and read from BigQuery tables as PyArrow tables."
 authors = [{ name = "Sebastian Pawluś" }]
 readme = "README.md"
