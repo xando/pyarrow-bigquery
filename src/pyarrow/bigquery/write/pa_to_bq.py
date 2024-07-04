@@ -13,7 +13,7 @@ def emit(schema):
         field_mode = "NULLABLE" if field.nullable else "REQUIRED"
         field_type = field.type
 
-        if pa.types.is_list(field_type):
+        if pa.types.is_list(field_type) or pa.types.is_large_list(field_type):
             field_mode = "REPEATED"
             field_type = field.type.value_type
 

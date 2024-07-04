@@ -37,7 +37,7 @@ def emit(schema, message_name):
         _repeated = False
         _type = field.type
 
-        if pa.types.is_list(_type):
+        if pa.types.is_list(_type) or pa.types.is_large_list(_type):
             _repeated = True
             _type = field.type.value_type
 
