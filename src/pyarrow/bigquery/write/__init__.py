@@ -131,7 +131,6 @@ class writer:
         table_overwrite: bool = False,
         worker_count: int = multiprocessing.cpu_count(),
         worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
-        batch_size: int = 100,
     ):
         self.project = project
         self.where = where
@@ -143,8 +142,6 @@ class writer:
 
         self.worker_count = worker_count
         self.worker_type = worker_type
-
-        self.batch_size = batch_size
 
         project_id, dataset_id, table_id = where.split(".")
 
@@ -187,10 +184,9 @@ class writer:
         return self
 
     def write_table(self, table):
-        for table_chunk in some_itertools.to_chunks(table, self.batch_size):
-            element = tempfile.mktemp(dir=self.temp_dir)
-            fa.write_feather(table_chunk, element)
-            self.queue_results.put(element)
+        element = tempfile.mktemp(dir=self.temp_dir)
+        fa.write_feather(table, element)
+        self.queue_results.put(element)
 
     def write_batch(self, batch):
         element = tempfile.mktemp(dir=self.temp_dir)
@@ -219,7 +215,7 @@ def write_table(
     table_overwrite: bool = False,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
-    batch_size: int = 100,
+    batch_size: int = 10,
 ):
     assert table.num_rows > 0, "Table is empty"
 
@@ -232,7 +228,6 @@ def write_table(
         table_overwrite=table_overwrite,
         worker_count=worker_count,
         worker_type=worker_type,
-        batch_size=batch_size,
     ) as w:
-        for table_chunk in some_itertools.to_split(table, w.worker_count):
+        for table_chunk in some_itertools.to_chunks(table, batch_size):
             w.write_table(table_chunk)

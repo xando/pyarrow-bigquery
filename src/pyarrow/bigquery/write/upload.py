@@ -18,7 +18,7 @@ def _send(stream, serialized_rows, offset):
     request.offset = offset
     request.proto_rows = proto_data
 
-    stream.append_rows_stream.send(request).result()
+    stream.append_rows_stream.send(request)
 
 
 def upload_data(stream, pa_table, protobuf_definition, offset):

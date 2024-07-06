@@ -148,8 +148,8 @@ Writes a PyArrow Table to a BigQuery Table. No return value.
 - `worker_count`: `int`, *default* `os.cpu_count()`  
   The number of threads or processes to use for fetching data from BigQuery.
 
-- `batch_size`: `int`, *default* `100`  
-  The batch size for fetched rows.
+- `batch_size`: `int`, *default* `10`  
+  The batch size used to upload.
 
 ```python
 bq.write_table(table, 'gcp_project.dataset.table')
@@ -184,9 +184,6 @@ Context manager version of the write method. Useful when the PyArrow table is la
 
 - `worker_count`: `int`, *default* `os.cpu_count()`  
   The number of threads or processes to use for writing data to BigQuery.
-
-- `batch_size`: `int`, *default* `100`  
-  The batch size used for writes. The table will be automatically split to this value.
 
 Depending on your use case, you might want to use one of the methods below to write your data to a BigQuery table, using either `pa.Table` or `pa.RecordBatch`.
 
