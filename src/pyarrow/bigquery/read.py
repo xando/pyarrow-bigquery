@@ -83,7 +83,7 @@ def _stream_worker(read_client, read_streams, table_schema, batch_size, queue_re
 
                 batches = table[batch_size:].to_batches()
 
-        logger.debug(f"Stream {stream.name} done in {time.time()-t:.2f} seconds")
+        logger.debug(f"Stream {stream.name} done in {time.time() - t:.2f} seconds")
 
     if batches:
         table = pa.Table.from_batches(batches)
@@ -168,7 +168,7 @@ class reader:
             w.join()
 
         shutil.rmtree(self.temp_dir, ignore_errors=True)
-        logger.debug(f"Time taken: {time.time()-self.t0:.2f}")
+        logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
     def __iter__(self):
         return self

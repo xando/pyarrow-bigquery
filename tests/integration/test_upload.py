@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.bigquery as bq
 
 
-PROJECT = os.environ['GCP_PROJECT']
+PROJECT = os.environ["GCP_PROJECT"]
 
 
 @pytest.fixture(scope="function")
@@ -14,7 +14,7 @@ def LOCATION():
     return f"{PROJECT}.test.{uuid.uuid4()}"
 
 
-@pytest.fixture(autouse=True, scope='function')
+@pytest.fixture(autouse=True, scope="function")
 def _remove_table(LOCATION):
     from google.cloud import bigquery
 
@@ -39,7 +39,7 @@ def test_reader_query(LOCATION):
 
     bq.write_table(table, LOCATION, table_create=True)
 
-    query = f'SELECT * FROM `{LOCATION}`'
+    query = f"SELECT * FROM `{LOCATION}`"
 
     with bq.reader_query(project=PROJECT, query=query) as r:
         table_back1 = pa.concat_tables(r)
