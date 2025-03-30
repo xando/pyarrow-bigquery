@@ -100,7 +100,9 @@ def generate(schema):
 
     pool = descriptor_pool.Default()
     pool.AddSerializedFile(
-        descriptor_pb2.FileDescriptorProto(name=file_name, message_type=[message_type]).SerializeToString()
+        descriptor_pb2.FileDescriptorProto(
+            name=file_name, message_type=[message_type]
+        ).SerializeToString()
     )
 
     return pool.FindMessageTypeByName(message_name)

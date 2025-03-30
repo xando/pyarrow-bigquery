@@ -9,7 +9,7 @@ keywords = ["pyarrow", "bigquery"]
 dependencies = [
     "google-cloud-bigquery>=3,<5",
     "google-cloud-bigquery-storage>=2,<3",
-    "pyarrow>=16,<17",
+    "pyarrow>=16,<20",
     "tenacity"
 ]
 
@@ -32,5 +32,5 @@ ignore_missing_imports = true
 [tool.ruff]
 exclude = [".git"]
 
-line-length = 120
+line-length = 100
 indent-width = 4

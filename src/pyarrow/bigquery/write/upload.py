@@ -6,7 +6,9 @@ from google.api_core.exceptions import Unknown
 from . import pa_to_pb
 
 
-@tenacity.retry(stop=tenacity.stop_after_attempt(5), retry=tenacity.retry_if_exception_type(Unknown))
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(5), retry=tenacity.retry_if_exception_type(Unknown)
+)
 def _send(stream, serialized_rows, offset):
     proto_rows = types.ProtoRows()
     proto_rows.serialized_rows.extend(serialized_rows)

@@ -51,10 +51,14 @@ def _bq_create_table(*, project, location, schema, expire, overwrite):
     logger.debug(f"Created BigQuery table '{location}'")
 
 
-def _bq_write_create_stream(write_client: bigquery_storage_v1.BigQueryWriteClient, parent, protobuf_definition):
+def _bq_write_create_stream(
+    write_client: bigquery_storage_v1.BigQueryWriteClient, parent, protobuf_definition
+):
     write_stream = write_client.create_write_stream(
         parent=parent,
-        write_stream=bigquery_storage_v1.types.WriteStream(type=bigquery_storage_v1.types.WriteStream.Type.PENDING),
+        write_stream=bigquery_storage_v1.types.WriteStream(
+            type=bigquery_storage_v1.types.WriteStream.Type.PENDING
+        ),
         retry=retry.Retry(predicate=retry.if_exception_type(Unknown, NotFound)),
     )
 

@@ -1,21 +1,27 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
-import tempfile
+import queue
 import multiprocessing
 import threading
-import shutil
 
 from google.cloud import bigquery_storage
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 
+
 import pyarrow as pa
-import pyarrow.feather as fa
 
 from . import some_itertools
+from . import exchange
+
+
+PYARROW_COMPRESSIONS = {
+    None: bigquery_storage.ArrowSerializationOptions.CompressionCodec.COMPRESSION_UNSPECIFIED,
+    "lz4": bigquery_storage.ArrowSerializationOptions.CompressionCodec.LZ4_FRAME,
+    "zstd": bigquery_storage.ArrowSerializationOptions.CompressionCodec.ZSTD,
+}
 
 
 logger = logging.getLogger(__name__)
@@ -35,19 +41,22 @@ def _bq_table_exists(project: str, location: str):
 def _bq_read_create_strems(
     read_client: bigquery_storage.BigQueryReadClient,
     parent: str,
-    location: str,
+    source: str,
     selected_fields: list | None,
     row_restrictions: str | None,
     max_stream_count: int,
+    compression: str | None = None,
 ) -> tuple[list[str], pa.Schema]:
-    project, dataset, table = location.split(".")
-
+    project, dataset, table = source.split(".")
     read_session = bigquery_storage.ReadSession(
         table=f"projects/{project}/datasets/{dataset}/tables/{table}",
         data_format=bigquery_storage.DataFormat.ARROW,
         read_options={
             "selected_fields": selected_fields,
             "row_restriction": row_restrictions,
+            "arrow_serialization_options": bigquery_storage.ArrowSerializationOptions(
+                buffer_compression=compression
+            ),
         },
     )
 
@@ -60,36 +69,39 @@ def _bq_read_create_strems(
     schema_buffer = pa.py_buffer(read_session.arrow_schema.serialized_schema)
     schema = pa.ipc.read_schema(schema_buffer)
 
-    return read_session.streams, schema
+    return ([s.name for s in read_session.streams], schema)
 
 
-def _stream_worker(read_client, read_streams, table_schema, batch_size, queue_results, temp_dir):
+def _stream_worker(
+    read_streams: list[str],
+    table_schema: pa.Schema,
+    batch_size: int,
+    queue_results: multiprocessing.Queue,
+    ipc_exchange: type[exchange],
+):
+    read_client = bigquery_storage.BigQueryReadClient()
     batches = []
-
     for stream in read_streams:
         t = time.time()
 
-        for message in read_client.read_rows(stream.name):
-            record_batch = pa.ipc.read_record_batch(message.arrow_record_batch.serialized_record_batch, table_schema)
+        for message in read_client.read_rows(stream):
+            record_batch = pa.ipc.read_record_batch(
+                message.arrow_record_batch.serialized_record_batch,
+                table_schema,
+            )
 
             batches.append(record_batch)
 
-            if sum(b.num_rows for b in batches) >= batch_size:
+            while batches and sum(b.num_rows for b in batches) >= batch_size:
                 table = pa.Table.from_batches(batches)
-
-                element = tempfile.mktemp(dir=temp_dir)
-                fa.write_feather(table[:batch_size], element)
-                queue_results.put(element)
-
+                queue_results.put(ipc_exchange.store(table[:batch_size]))
                 batches = table[batch_size:].to_batches()
 
-        logger.debug(f"Stream {stream.name} done in {time.time()-t:.2f} seconds")
+        logger.debug(f"Stream {stream} done in {time.time() - t:.2f} seconds")
 
     if batches:
-        table = pa.Table.from_batches(batches)
-        element = tempfile.mktemp(dir=temp_dir)
-        fa.write_feather(table, element)
-        queue_results.put(element)
+        queue_key = ipc_exchange.store(pa.Table.from_batches(batches))
+        queue_results.put(queue_key)
 
     queue_results.put(None)
 
@@ -104,7 +116,9 @@ class reader:
         row_restrictions: str | None = None,
         worker_count: int = multiprocessing.cpu_count(),
         worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+        ipc_exchange: type | None = None,
         batch_size: int = 100,
+        compression: str | None = None,
     ):
         self.source = source
         self.project = project
@@ -114,17 +128,57 @@ class reader:
         self.worker_type = worker_type
         self.batch_size = batch_size
 
+        # COMPRESSIONS
+        assert compression in PYARROW_COMPRESSIONS, (
+            f"Compression {self.compression} not supported, "
+            f"available: {list(PYARROW_COMPRESSIONS.keys())}"
+        )
+        self.compression = PYARROW_COMPRESSIONS[compression]
+
+        # IPC EXCHANGE
+        match (ipc_exchange, worker_type):
+            case (None, threading.Thread):
+                self.ipc_exchange = exchange.Memory()
+            case (None, multiprocessing.Process):
+                self.ipc_exchange = exchange.Feather()
+            case _:
+                self.ipc_exchange = ipc_exchange
+
+        if self.worker_type == threading.Thread:
+            assert isinstance(self.ipc_exchange, exchange.Memory), (
+                "Memory exchange is not supported with threading"
+            )
+
+        if self.worker_type == multiprocessing.Process:
+            assert isinstance(self.ipc_exchange, (exchange.Feather, exchange.SharedMemory)), (
+                "Feather and SharedMemory exchanges are not supported with multiprocessing"
+            )
+
+        # DEFAULT PROJECT from source
         project_id, *_ = source.split(".")
 
         if not project:
             self.project = project_id
 
+        logger.debug(
+            "Reading with: "
+            f"Project: {self.project}, "
+            f"Source: {self.source}, "
+            f"Columns: {self.columns}, "
+            f"Row restrictions: {self.row_restrictions}, "
+            f"Worker count: {self.worker_count}, "
+            f"Worker type: {self.worker_type}, "
+            f"IPC exchange: {self.ipc_exchange}, "
+            f"Batch size: {self.batch_size}, "
+            f"Compression: {self.compression}"
+        )
+
     def __enter__(self):
         self.t0 = time.time()
 
         self.queue_results = multiprocessing.Queue()
+        self.queue_read = queue.Queue()
         self.read_client = bigquery_storage.BigQueryReadClient()
-        self.temp_dir = tempfile.mkdtemp()
         self.workers = []
 
         _bq_table_exists(self.project, self.source)
@@ -132,30 +186,33 @@ class reader:
         self.streams, self.schema = _bq_read_create_strems(
             read_client=self.read_client,
             parent=self.project,
-            location=self.source,
+            source=self.source,
             selected_fields=self.columns,
             row_restrictions=self.row_restrictions,
             max_stream_count=self.worker_count * 3,
+            compression=self.compression,
         )
+
         self.workers_done = 0
 
         assert self.streams, "No streams to read, Table might be empty"
 
         self.actual_worker_count = min(self.worker_count, len(self.streams))
 
-        logger.debug(f"Number of workers: {self.worker_count}, number of streams: {len(self.streams)}")
+        logger.debug(
+            f"Number of workers: {self.worker_count}, number of streams: {len(self.streams)}"
+        )
         logger.debug(f"Actual worker count: {self.actual_worker_count}")
 
-        for worker_streams in some_itertools.to_split(self.streams, self.actual_worker_count):
+        for read_streams in some_itertools.to_split(self.streams, self.actual_worker_count):
             worker = self.worker_type(
                 target=_stream_worker,
                 args=(
-                    self.read_client,
-                    worker_streams,
+                    read_streams,
                     self.schema,
                     self.batch_size,
                     self.queue_results,
-                    self.temp_dir,
+                    self.ipc_exchange,
                 ),
             )
             worker.start()
@@ -167,8 +224,7 @@ class reader:
         for w in self.workers:
             w.join()
 
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-        logger.debug(f"Time taken: {time.time()-self.t0:.2f}")
+        logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
     def __iter__(self):
         return self
@@ -177,15 +233,12 @@ class reader:
         element = self.queue_results.get()
         if not element:
             self.workers_done += 1
-
             if self.workers_done == self.actual_worker_count:
                 raise StopIteration
             else:
                 return self.__next__()
         else:
-            table = fa.read_table(element)
-            os.remove(element)
-            return table
+            return self.ipc_exchange.load(element)
 
 
 def reader_query(
@@ -194,7 +247,9 @@ def reader_query(
     *,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+    ipc_exchange: type[exchange] | None = None,
     batch_size: int = 100,
+    compression: str | None = None,
 ):
     client = bigquery.Client(project=project)
     job = client.query(query)
@@ -207,7 +262,9 @@ def reader_query(
         project=project,
         worker_count=worker_count,
         worker_type=worker_type,
+        ipc_exchange=ipc_exchange,
         batch_size=batch_size,
+        compression=compression,
     )
 
 
@@ -219,8 +276,10 @@ def read_table(
     row_restrictions: str | None = None,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+    ipc_exchange: type[exchange] | None = None,
     batch_size: int = 100,
-):
+    compression: str | None = None,
+) -> pa.Table:
     with reader(
         source=source,
         project=project,
@@ -228,7 +287,9 @@ def read_table(
         row_restrictions=row_restrictions,
         worker_count=worker_count,
         worker_type=worker_type,
+        ipc_exchange=ipc_exchange,
         batch_size=batch_size,
+        compression=compression,
     ) as r:
         return pa.concat_tables(r)
 
@@ -239,9 +300,17 @@ def read_query(
     *,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+    ipc_exchange: type[exchange] | None = None,
     batch_size: int = 100,
+    compression: str | None = None,
 ):
     with reader_query(
-        project=project, query=query, worker_count=worker_count, worker_type=worker_type, batch_size=batch_size
+        project=project,
+        query=query,
+        worker_count=worker_count,
+        worker_type=worker_type,
+        ipc_exchange=ipc_exchange,
+        batch_size=batch_size,
+        compression=compression,
     ) as r:
         return pa.concat_tables(r)
