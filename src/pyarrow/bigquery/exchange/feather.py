@@ -10,7 +10,6 @@ PREFIX = "pyarrow-bigquery-"
 
 class Feather:
     def store(self, table: pa.Table) -> str:
-
         _, file_name = tempfile.mkstemp(prefix=PREFIX)
 
         with open(file_name, "wb") as f:

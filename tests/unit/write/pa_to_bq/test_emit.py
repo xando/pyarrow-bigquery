@@ -56,7 +56,9 @@ def test_struct():
 
 
 def test_repeated_struct():
-    schema = pa.schema([("repeated_struct", pa.list_(pa.struct([("key_1", pa.string()), ("key_2", pa.string())])))])
+    schema = pa.schema(
+        [("repeated_struct", pa.list_(pa.struct([("key_1", pa.string()), ("key_2", pa.string())])))]
+    )
 
     result = emit(schema)
 
