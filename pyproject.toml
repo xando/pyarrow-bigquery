@@ -5,16 +5,17 @@ description = "An extension library to write to and read from BigQuery tables as
 authors = [{ name = "Sebastian Pawluś" }]
 readme = "README.md"
 keywords = ["pyarrow", "bigquery"]
+requires-python = ">=3.10,<3.13"
+
 
 dependencies = [
     "google-cloud-bigquery>=3,<5",
     "google-cloud-bigquery-storage>=2,<3",
-
     "pyarrow>=16,<20",
     "tenacity"
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest",
     "ruff",
