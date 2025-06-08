@@ -1,12 +1,16 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "pyarrow-bigquery"
 version = "0.5.7"
 description = "An extension library to write to and read from BigQuery tables as PyArrow tables."
 authors = [{ name = "Sebastian Pawluś" }]
 readme = "README.md"
+license = { text = "MIT" }
 keywords = ["pyarrow", "bigquery"]
-requires-python = ">=3.10,<3.13"
-
+requires-python = ">=3.13,<3.14"
 
 dependencies = [
     "google-cloud-bigquery>=3,<5",
@@ -19,23 +23,13 @@ dependencies = [
 dev = [
     "pytest",
     "ruff",
+    "ipdb"
 ]
 
-[project.license]
-text = "MIT"
-
-[build-system]
-requires = ["setuptools>=40.6.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [tool.setuptools.packages.find]
-where = ["src/"]
-include = ["pyarrow.bigquery*"]
-
-[[tool.mypy.overrides]]
-module = ["pyarrow.*"]
-ignore_missing_imports = true
-
+where = ["src"]
+include = ["pyarrow.bigquery*"]  # Important for namespace package
+namespaces = true                # Enable PEP 420 namespace package discovery
 
 [tool.ruff]
 exclude = [".git"]
