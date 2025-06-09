@@ -1,8 +1,13 @@
 import pyarrow as pa
 import uuid
 
+from .base import ConcurrencyCompatible
 
-class Memory:
+
+class Memory(ConcurrencyCompatible):
+    thread_compatible = True
+    process_compatible = False
+
     def __init__(self):
         self.memory = {}
 

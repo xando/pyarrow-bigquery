@@ -9,6 +9,8 @@ from multiprocessing import resource_tracker
 import pyarrow as pa  # type: ignore[import]
 
 
+from .base import ConcurrencyCompatible
+
 
 class _ReadBufferWrapper:
     def __init__(self, shm: shared_memory.SharedMemory):
@@ -33,8 +35,9 @@ class _ReadBufferWrapper:
             pass
 
 
-class SharedMemory:
-
+class SharedMemory(ConcurrencyCompatible):
+    thread_compatible = False
+    process_compatible = True
 
     def __init__(self):
         if sys.version_info <= (3, 12):

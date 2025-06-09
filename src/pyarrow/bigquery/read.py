@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
-import queue
 import multiprocessing
 import threading
+import inspect
 
 from google.cloud import bigquery_storage
 from google.cloud import bigquery
@@ -23,7 +23,6 @@ PYARROW_COMPRESSIONS = {
     "zstd": bigquery_storage.ArrowSerializationOptions.CompressionCodec.ZSTD,
 }
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +31,7 @@ def _bq_table_exists(project: str, location: str):
 
     try:
         client.get_table(location)
-        logger.debug(f"Table {location} already exists")
+        logger.debug(f"Table {location} indeed exists")
     except NotFound as e:
         logger.debug("Table {location} is not found")
         raise e
@@ -45,7 +44,7 @@ def _bq_read_create_strems(
     selected_fields: list | None,
     row_restrictions: str | None,
     max_stream_count: int,
-    compression: str | None = None,
+    compression: bigquery_storage.ArrowSerializationOptions.CompressionCodec,
 ) -> tuple[list[str], pa.Schema]:
     project, dataset, table = source.split(".")
     read_session = bigquery_storage.ReadSession(
@@ -77,7 +76,7 @@ def _stream_worker(
     table_schema: pa.Schema,
     batch_size: int,
     queue_results: multiprocessing.Queue,
-    ipc_exchange: type[exchange],
+    ipc_exchange,
 ):
     read_client = bigquery_storage.BigQueryReadClient()
     batches = []
@@ -116,12 +115,11 @@ class reader:
         row_restrictions: str | None = None,
         worker_count: int = multiprocessing.cpu_count(),
         worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
-        ipc_exchange: type | None = None,
+        ipc_exchange: exchange.ConcurrencyCompatible | None = None,
         batch_size: int = 100,
         compression: str | None = None,
     ):
         self.source = source
-        self.project = project
         self.columns = columns
         self.row_restrictions = row_restrictions
         self.worker_count = worker_count
@@ -130,35 +128,46 @@ class reader:
 
         # COMPRESSIONS
         assert compression in PYARROW_COMPRESSIONS, (
-            f"Compression {self.compression} not supported, "
+            f"Compression {compression} not supported, "
             f"available: {list(PYARROW_COMPRESSIONS.keys())}"
         )
         self.compression = PYARROW_COMPRESSIONS[compression]
 
         # IPC EXCHANGE
-        match (ipc_exchange, worker_type):
-            case (None, threading.Thread):
-                self.ipc_exchange = exchange.Memory()
-            case (None, multiprocessing.Process):
-                self.ipc_exchange = exchange.Feather()
-            case _:
-                self.ipc_exchange = ipc_exchange
+        if ipc_exchange is None:
+            if worker_type == threading.Thread:
+                ipc_exchange = exchange.Memory()
+            elif worker_type == multiprocessing.Process:
+                ipc_exchange = exchange.Feather()
+            else:
+                raise ValueError(
+                    f"Unsupported worker type {worker_type}, "
+                    f"expected threading.Thread or multiprocessing.Process"
+                )
+
+        if inspect.isclass(ipc_exchange):
+            raise TypeError(
+                f"Expected an instance of object, got class definition {ipc_exchange.__class__}, "
+                f" did you forget to instantiate it?"
+            )
 
         if self.worker_type == threading.Thread:
-            assert isinstance(self.ipc_exchange, exchange.Memory), (
-                "Memory exchange is not supported with threading"
-            )
+            if not ipc_exchange.thread_compatible:
+                raise ValueError(f"Exchange {ipc_exchange} is not supported with threading, ")
 
         if self.worker_type == multiprocessing.Process:
-            assert isinstance(self.ipc_exchange, (exchange.Feather, exchange.SharedMemory)), (
-                "Feather and SharedMemory exchanges are not supported with multiprocessing"
-            )
+            if not ipc_exchange.process_compatible:
+                raise ValueError(f"Exchange {ipc_exchange} is not supported with multiprocessing, ")
+
+        self.ipc_exchange = ipc_exchange
 
         # DEFAULT PROJECT from source
         project_id, *_ = source.split(".")
 
-        if not project:
+        if project is None:
             self.project = project_id
+        else:
+            self.project = project
 
         logger.debug(
             "Reading with: "
@@ -175,9 +184,8 @@ class reader:
 
     def __enter__(self):
         self.t0 = time.time()
-
-        self.queue_results = multiprocessing.Queue()
-        self.queue_read = queue.Queue()
+        self.manager = multiprocessing.Manager()
+        self.queue_results = self.manager.Queue()
         self.read_client = bigquery_storage.BigQueryReadClient()
         self.workers = []
 
@@ -247,7 +255,7 @@ def reader_query(
     *,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
-    ipc_exchange: type[exchange] | None = None,
+    ipc_exchange: exchange.ConcurrencyCompatible | None = None,
     batch_size: int = 100,
     compression: str | None = None,
 ):
@@ -255,7 +263,7 @@ def reader_query(
     job = client.query(query)
     job.result()
 
-    source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"
+    source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"  # type: ignore
 
     return reader(
         source=source,
@@ -276,7 +284,7 @@ def read_table(
     row_restrictions: str | None = None,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
-    ipc_exchange: type[exchange] | None = None,
+    ipc_exchange: exchange.ConcurrencyCompatible | None = None,
     batch_size: int = 100,
     compression: str | None = None,
 ) -> pa.Table:
@@ -300,7 +308,7 @@ def read_query(
     *,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
-    ipc_exchange: type[exchange] | None = None,
+    ipc_exchange: exchange.ConcurrencyCompatible | None = None,
     batch_size: int = 100,
     compression: str | None = None,
 ):
