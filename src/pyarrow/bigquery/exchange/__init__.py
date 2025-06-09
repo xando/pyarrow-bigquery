@@ -1,4 +1,4 @@
-from .base import works_with, ConcurrencyCompatible  # noqa: F401
+from .base import ConcurrencyCompatible  # noqa: F401
 
 from .shared_memory import SharedMemory  # noqa
 from .feather import Feather  # noqa: F401
