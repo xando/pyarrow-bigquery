@@ -253,13 +253,14 @@ def reader_query(
     project: str,
     query: str,
     *,
+    location: str | None = None,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     ipc_exchange: exchange.ConcurrencyCompatible | None = None,
     batch_size: int = 100,
     compression: str | None = None,
 ):
-    client = bigquery.Client(project=project)
+    client = bigquery.Client(project=project, location=location)
     job = client.query(query)
     job.result()
 
@@ -306,6 +307,7 @@ def read_query(
     project: str,
     query: str,
     *,
+    location: str | None = None,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     ipc_exchange: exchange.ConcurrencyCompatible | None = None,
@@ -315,6 +317,7 @@ def read_query(
     with reader_query(
         project=project,
         query=query,
+        location=location,
         worker_count=worker_count,
         worker_type=worker_type,
         ipc_exchange=ipc_exchange,
