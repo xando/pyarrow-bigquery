@@ -1,21 +1,18 @@
 from __future__ import annotations
 
+import datetime
+import inspect
 import logging
-import time
 import multiprocessing
 import threading
-import inspect
+import time
 
-from google.cloud import bigquery_storage
-from google.cloud import bigquery
+from google.cloud import bigquery, bigquery_storage
 from google.cloud.exceptions import NotFound
-
 
 import pyarrow as pa
 
-from . import some_itertools
-from . import exchange
-
+from . import exchange, some_itertools
 
 PYARROW_COMPRESSIONS = {
     None: bigquery_storage.ArrowSerializationOptions.CompressionCodec.COMPRESSION_UNSPECIFIED,
@@ -254,6 +251,9 @@ def reader_query(
     query: str,
     *,
     location: str | None = None,
+    large_results: bool = False,
+    large_results_dataset: str = "_temp_pyarrow_bigquery",
+    large_results_expiration_ms: int = 24 * 60 * 60 * 1000,  # 24 hours
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     ipc_exchange: exchange.ConcurrencyCompatible | None = None,
@@ -261,7 +261,23 @@ def reader_query(
     compression: str | None = None,
 ):
     client = bigquery.Client(project=project, location=location)
-    job = client.query(query)
+
+    if large_results:
+        dataset = bigquery.Dataset(f"{project}.{large_results_dataset}")
+        dataset.default_table_expiration_ms = large_results_expiration_ms
+        client.create_dataset(dataset, exists_ok=True)
+
+        table = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+        destination = f"{project}.{large_results_dataset}.{table}"
+
+        job_config = bigquery.QueryJobConfig(
+            destination=destination,
+        )
+    else:
+        job_config = bigquery.QueryJobConfig()
+
+    job = client.query(query, job_config=job_config)
     job.result()
 
     source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"  # type: ignore
@@ -308,6 +324,9 @@ def read_query(
     query: str,
     *,
     location: str | None = None,
+    large_results: bool = False,
+    large_results_dataset: str = "_temp_pyarrow_bigquery",
+    large_results_expiration_ms: int = 24 * 60 * 60 * 1000,  # 24 hours
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     ipc_exchange: exchange.ConcurrencyCompatible | None = None,
@@ -318,6 +337,9 @@ def read_query(
         project=project,
         query=query,
         location=location,
+        large_results=large_results,
+        large_results_dataset=large_results_dataset,
+        large_results_expiration_ms=large_results_expiration_ms,
         worker_count=worker_count,
         worker_type=worker_type,
         ipc_exchange=ipc_exchange,
