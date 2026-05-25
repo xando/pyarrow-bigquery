@@ -1,13 +1,28 @@
 import tenacity
 
 from google.cloud.bigquery_storage_v1 import types
-from google.api_core.exceptions import Unknown
+from google.api_core.exceptions import (
+    DeadlineExceeded,
+    InternalServerError,
+    ResourceExhausted,
+    ServiceUnavailable,
+    Unknown,
+)
 
 from . import pa_to_pb
 
+_RETRYABLE_EXCEPTIONS = (
+    Unknown,
+    DeadlineExceeded,
+    ServiceUnavailable,
+    InternalServerError,
+    ResourceExhausted,
+)
+
 
 @tenacity.retry(
-    stop=tenacity.stop_after_attempt(5), retry=tenacity.retry_if_exception_type(Unknown)
+    stop=tenacity.stop_after_attempt(5),
+    retry=tenacity.retry_if_exception_type(_RETRYABLE_EXCEPTIONS),
 )
 def _send(stream, serialized_rows, offset):
     proto_rows = types.ProtoRows()
