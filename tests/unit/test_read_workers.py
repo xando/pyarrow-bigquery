@@ -23,7 +23,7 @@ def test_thread_reader_uses_thread_queue_without_manager(monkeypatch):
     monkeypatch.setattr(read_mod, "_bq_table_exists", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         read_mod,
-        "_bq_read_create_strems",
+        "_bq_read_create_streams",
         lambda **kwargs: (["stream-1"], pa.schema([("x", pa.int64())])),
     )
     monkeypatch.setattr(read_mod, "_stream_worker", fake_stream_worker)

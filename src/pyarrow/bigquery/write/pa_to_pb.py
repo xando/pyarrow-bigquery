@@ -108,7 +108,7 @@ def generate(schema):
     return pool.FindMessageTypeByName(message_name)
 
 
-def ammend_schema(schema):
+def amend_schema(schema):
     def _cast_field(field):
         if pa.types.is_struct(field.type):
             new_fields = [_cast_field(sub_field) for sub_field in field.type]
@@ -130,7 +130,7 @@ def ammend_schema(schema):
 def serialize(pa_table, protobuf_definition):
     Message = message_factory.GetMessageClass(protobuf_definition)
 
-    pa_table = pa_table.cast(ammend_schema(pa_table.schema))
+    pa_table = pa_table.cast(amend_schema(pa_table.schema))
 
     rows = []
     size = 0

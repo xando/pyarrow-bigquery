@@ -1,5 +1,5 @@
 import pyarrow as pa
-from pyarrow.bigquery.write.pa_to_pb import ammend_schema
+from pyarrow.bigquery.write.pa_to_pb import amend_schema
 
 
 def test_1d():
@@ -14,7 +14,7 @@ def test_1d():
         ]
     )
 
-    _schema = ammend_schema(schema)
+    _schema = amend_schema(schema)
 
     assert len(schema) == len(_schema)
     assert all(t.type == pa.string() for t in _schema)
@@ -32,7 +32,7 @@ def test_2d():
         ]
     )
 
-    _schema = ammend_schema(schema)
+    _schema = amend_schema(schema)
 
     assert len(schema) == len(_schema)
     assert all(f.type.value_type == pa.string() for f in _schema)
@@ -50,7 +50,7 @@ def test_3d():
         ]
     )
 
-    _schema = ammend_schema(schema)
+    _schema = amend_schema(schema)
 
     assert len(schema) == len(_schema)
 

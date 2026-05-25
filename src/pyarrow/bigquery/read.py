@@ -62,7 +62,7 @@ def _bq_table_exists(project: str, location: str):
         raise e
 
 
-def _bq_read_create_strems(
+def _bq_read_create_streams(
     read_client: bigquery_storage.BigQueryReadClient,
     parent: str,
     source: str,
@@ -230,7 +230,7 @@ class reader:
         _bq_table_exists(self.project, self.source)
 
         try:
-            self.streams, self.schema = _bq_read_create_strems(
+            self.streams, self.schema = _bq_read_create_streams(
                 read_client=self.read_client,
                 parent=self.project,
                 source=self.source,
