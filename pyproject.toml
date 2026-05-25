@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyarrow-bigquery"
-version = "0.5.7"
+version = "0.6.0"
 description = "An extension library to write to and read from BigQuery tables as PyArrow tables."
 authors = [{ name = "Sebastian Pawluś" }]
 readme = "README.md"
 license = { text = "MIT" }
 keywords = ["pyarrow", "bigquery"]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10"
 
 dependencies = [
-    "google-cloud-bigquery>=3,<5",
-    "google-cloud-bigquery-storage>=2,<3",
+    "google-cloud-bigquery>=3.10.0,<5",
+    "google-cloud-bigquery-storage>=2.18.0,<3",
     "pyarrow",
     "tenacity"
 ]
