@@ -1,5 +1,4 @@
 
-
 # pyarrow-bigquery
 
 An extension library to **write** to and **read** from BigQuery tables as PyArrow tables.
@@ -12,104 +11,186 @@ An extension library to **write** to and **read** from BigQuery tables as PyArro
 pip install pyarrow-bigquery
 ```
 
+Authenticate with Google Cloud (Application Default Credentials), for example:
+
+```bash
+gcloud auth application-default login
+```
+
 ## Source Code
 
 https://github.com/xando/pyarrow-bigquery/
 
 ## Quick Start
 
-This guide will help you quickly get started with `pyarrow-bigquery`, a library that allows you to **read** from and **write** to Google BigQuery using PyArrow.
+Import the namespace package:
+
+```python
+import pyarrow as pa
+import pyarrow.bigquery as bq
+```
+
+Table and query locations use `project.dataset.table`. The project in the path is also used as the billing project unless you pass `project=` explicitly.
 
 ### Reading
 
-`pyarrow-bigquery` offers four methods to read BigQuery tables as PyArrow tables. Depending on your use case and/or the table size, you can choose the most suitable method.
+| Goal | API |
+|------|-----|
+| Whole table in memory | `read_table` |
+| Whole query result in memory | `read_query` |
+| Stream a large table in chunks | `reader` (context manager) |
+| Stream a large query in chunks | `reader_query` (context manager) |
 
-**Read from a Table Location**
-
-When the table is small enough to fit in memory, you can read it directly using `read_table`.
+**Small table — load entirely**
 
 ```python
-import pyarrow.bigquery as bq
-
-table = bq.read_table("gcp_project.dataset.small_table")
-
-print(table.num_rows)
+table = bq.read_table("my_project.my_dataset.events")
+print(table.num_rows, table.schema)
 ```
 
-**Read from a Query**
-
-Alternatively, if the query results are small enough to fit in memory, you can read them directly using `read_query`.
+**Small query — load entirely**
 
 ```python
-import pyarrow.bigquery as bq
-
 table = bq.read_query(
-    project="gcp_project",
-    query="SELECT * FROM `gcp_project.dataset.small_table`"
+    project="my_project",
+    query="SELECT id, ts FROM `my_project.my_dataset.events` WHERE ts >= '2024-01-01'",
 )
-
-print(table.num_rows)
 ```
 
-**Read in Batches**
-
-If the target table is larger than memory or you prefer not to fetch the entire table at once, you can use the `bq.reader` iterator method with the `batch_size` parameter to limit how much data is fetched per iteration.
+**Large table — iterate batches**
 
 ```python
-import pyarrow.bigquery as bq
-
-for table in bq.reader("gcp_project.dataset.big_table", batch_size=100):
-    print(table.num_rows)
+with bq.reader("my_project.my_dataset.events", batch_size=10_000) as r:
+    for chunk in r:
+        process(chunk)  # each chunk is a pa.Table
 ```
 
-**Read Query in Batches**
-
-Similarly, you can read data in batches from a query using `reader_query`.
+**Large query — iterate batches**
 
 ```python
-import pyarrow.bigquery as bq
-
 with bq.reader_query(
-    project="gcp_project",
-    query="SELECT * FROM `gcp_project.dataset.small_table`"
-) as reader:
-    print(reader.schema)
-    for table in reader:
-        print(table.num_rows)
+    project="my_project",
+    query="SELECT * FROM `my_project.my_dataset.events`",
+    batch_size=10_000,
+) as r:
+    print(r.schema)
+    for chunk in r:
+        process(chunk)
 ```
 
 ### Writing
 
-The package provides two methods to write to BigQuery. Depending on your use case or the table size, you can choose the appropriate method.
+| Goal | API |
+|------|-----|
+| Upload a table in one call | `write_table` |
+| Stream many chunks (generator, ETL, etc.) | `writer` (context manager) |
 
-**Write the Entire Table**
-
-To write a complete table at once, use the `bq.write_table` method.
+**One-shot upload**
 
 ```python
-import pyarrow as pa
-import pyarrow.bigquery as bq
-
-table = pa.Table.from_arrays([[1, 2, 3, 4]], names=['integers'])
-
-bq.write_table(table, 'gcp_project.dataset.table')
+table = pa.table({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+bq.write_table(table, "my_project.my_dataset.names")
 ```
 
-**Write in Batches**
-
-If you need to write data in smaller chunks, use the `bq.writer` method with the `schema` parameter to define the table structure.
+**Streaming upload**
 
 ```python
-import pyarrow as pa
-import pyarrow.bigquery as bq
+schema = pa.schema([("id", pa.int64()), ("payload", pa.string())])
 
-schema = pa.schema([
-    ("integers", pa.int64())
-])
+with bq.writer(schema, "my_project.my_dataset.streamed") as w:
+    for batch in generate_batches():
+        w.write_table(batch)  # or w.write_batch(record_batch)
+```
 
-with bq.writer("gcp_project.dataset.table", schema=schema) as writer:
-    writer.write_batch(record_batch)
-    writer.write_table(table)
+---
+
+## Examples
+
+### Column projection and row filters
+
+BigQuery applies `columns` and `row_restrictions` before data is streamed to clients:
+
+```python
+table = bq.read_table(
+    "my_project.my_dataset.events",
+    columns=["user_id", "event_name", "ts"],
+    row_restrictions="event_name = 'purchase' AND ts >= '2024-06-01'",
+)
+```
+
+The same options work on `reader`, `read_query`, and `reader_query`.
+
+### Query location and large results
+
+Pass `location` when the query must run in a specific region. For very large query outputs, materialize into a temporary table and read via the Storage API:
+
+```python
+with bq.reader_query(
+    project="my_project",
+    query="SELECT * FROM huge_join ...",
+    location="EU",
+    large_results=True,
+    batch_size=50_000,
+) as r:
+    for chunk in r:
+        process(chunk)
+# temporary result table is deleted on exit when large_results=True
+```
+
+`read_query(..., large_results=True)` works the same way but loads everything into memory.
+
+### Parallel workers and IPC exchange
+
+Reads and writes use a pool of threads or processes (`worker_count`, `worker_type`). For **process** workers, pass an IPC exchange compatible with multiprocessing (default: `exchange.ArrowIpc()`):
+
+```python
+import multiprocessing
+import pyarrow.bigquery.exchange as exchange
+
+with bq.reader(
+    "my_project.my_dataset.big_table",
+    worker_type=multiprocessing.Process,
+    worker_count=8,
+    ipc_exchange=exchange.ArrowIpc(),
+    compression="zstd",
+) as r:
+    for chunk in r:
+        process(chunk)
+```
+
+Thread workers default to `exchange.Memory()`. Other exchanges (`Feather`, `SharedMemory`, …) are available under `pyarrow.bigquery.exchange` for advanced tuning.
+
+### Table creation options on write
+
+```python
+# Replace table if it already exists
+bq.write_table(
+    table,
+    "my_project.my_dataset.snapshot",
+    table_overwrite=True,
+)
+
+# Auto-expire after 7 days
+bq.write_table(
+    table,
+    "my_project.my_dataset.temp_export",
+    table_expire=7 * 24 * 3600,
+)
+
+# Append to an existing table (must already exist and match schema)
+bq.write_table(
+    more_rows,
+    "my_project.my_dataset.events",
+    table_create=False,
+)
+```
+
+### Chunked write with `batch_size`
+
+`write_table` splits the input into upload chunks (default `batch_size=10` rows per chunk):
+
+```python
+bq.write_table(large_table, "my_project.my_dataset.loaded", batch_size=5000)
 ```
 
 ---
@@ -120,250 +201,149 @@ with bq.writer("gcp_project.dataset.table", schema=schema) as writer:
 
 #### `pyarrow.bigquery.write_table`
 
-Writes a PyArrow Table to a BigQuery Table. No return value.
+Writes a PyArrow table to BigQuery. Returns nothing.
 
 **Parameters:**
 
-- `table`: `pa.Table`  
-  The PyArrow table.
-
-- `where`: `str`  
-  The destination location in the BigQuery catalog.
-
-- `project`: `str`, *default* `None`  
-  The BigQuery execution project, also the billing project. If not provided, it will be extracted from `where`.
-
-- `table_create`: `bool`, *default* `True`  
-  Specifies if the BigQuery table should be created.
-
-- `table_expire`: `None | int`, *default* `None`  
-  The number of seconds after which the created table will expire. Used only if `table_create` is `True`. Set to `None` to disable expiration.
-
-- `table_overwrite`: `bool`, *default* `False`  
-  If the table already exists, it will be destroyed and a new one will be created.
-
-- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
-  The worker backend for fetching data.
-
-- `worker_count`: `int`, *default* `os.cpu_count()`  
-  The number of threads or processes to use for fetching data from BigQuery.
-
-- `batch_size`: `int`, *default* `10`  
-  The batch size used to upload.
+- `table`: `pa.Table` — must be non-empty.
+- `where`: `str` — destination `project.dataset.table`.
+- `project`: `str | None`, *default* `None` — billing project; inferred from `where` when omitted.
+- `table_create`: `bool`, *default* `True` — create the destination table if missing.
+- `table_expire`: `int | None`, *default* `None` — seconds until table expiry (only when creating).
+- `table_overwrite`: `bool`, *default* `False` — delete and recreate the table if it exists.
+- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`.
+- `worker_count`: `int`, *default* `os.cpu_count()`.
+- `batch_size`: `int`, *default* `10` — rows per upload chunk inside the call.
 
 ```python
-bq.write_table(table, 'gcp_project.dataset.table')
+bq.write_table(table, "my_project.my_dataset.out")
 ```
 
-#### `pyarrow.bigquery.writer` (Context Manager)
+#### `pyarrow.bigquery.writer` (context manager)
 
-Context manager version of the write method. Useful when the PyArrow table is larger than memory size or the table is available in chunks.
+Incremental writes. Constructor: `writer(schema, where, **options)`.
 
-**Parameters:**
+**Parameters:** same table-creation and worker options as `write_table` (no `batch_size` on the context manager itself).
 
-- `schema`: `pa.Schema`  
-  The PyArrow schema.
+**Methods:**
 
-- `where`: `str`  
-  The destination location in the BigQuery catalog.
-
-- `project`: `str`, *default* `None`  
-  The BigQuery execution project, also the billing project. If not provided, it will be extracted from `where`.
-
-- `table_create`: `bool`, *default* `True`  
-  Specifies if the BigQuery table should be created.
-
-- `table_expire`: `None | int`, *default* `None`  
-  The number of seconds after which the created table will expire. Used only if `table_create` is `True`. Set to `None` to disable expiration.
-
-- `table_overwrite`: `bool`, *default* `False`  
-  If the table already exists, it will be destroyed and a new one will be created.
-
-- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
-  The worker backend for writing data.
-
-- `worker_count`: `int`, *default* `os.cpu_count()`  
-  The number of threads or processes to use for writing data to BigQuery.
-
-Depending on your use case, you might want to use one of the methods below to write your data to a BigQuery table, using either `pa.Table` or `pa.RecordBatch`.
-
-#### `pyarrow.bigquery.writer.write_table` (Context Manager Method)
-
-Context manager method to write a table.
-
-**Parameters:**
-
-- `table`: `pa.Table`  
-  The PyArrow table.
+- `write_table(table: pa.Table)` — enqueue a table chunk.
+- `write_batch(batch: pa.RecordBatch)` — enqueue a single record batch.
 
 ```python
-import pyarrow as pa
-import pyarrow.bigquery as bq
+schema = pa.schema([("n", pa.int64())])
 
-schema = pa.schema([("value", pa.list_(pa.int64()))])
-
-with bq.writer("gcp_project.dataset.table", schema=schema) as writer:
-    for a in range(1000):
-        writer.write_table(pa.Table.from_pylist([{'value': [a] * 10}]))
+with bq.writer(schema, "my_project.my_dataset.incremental") as w:
+    w.write_batch(pa.record_batch([pa.array([1, 2])], schema=schema))
+    w.write_table(pa.table({"n": [3, 4, 5]}))
 ```
 
-#### `pyarrow.bigquery.writer.write_batch` (Context Manager Method)
+#### `pyarrow.bigquery.writer.write_table` / `write_batch`
 
-Context manager method to write a record batch.
-
-**Parameters:**
-
-- `batch`: `pa.RecordBatch`  
-  The PyArrow record batch.
+See `writer` above. Typical loop:
 
 ```python
-import pyarrow as pa
-import pyarrow.bigquery as bq
-
-schema = pa.schema([("value", pa.list_(pa.int64()))])
-
-with bq.writer("gcp_project.dataset.table", schema=schema) as writer:
-    for a in range(1000):
-        writer.write_batch(pa.RecordBatch.from_pylist([{'value': [1] * 10}]))
+with bq.writer(schema, "my_project.my_dataset.rows") as w:
+    for i in range(1000):
+        w.write_table(pa.table({"value": [i] * 10}, schema=schema))
 ```
 
 ### Reading
 
 #### `pyarrow.bigquery.read_table`
 
+Loads a full table into memory (`pa.concat_tables` over internal batches).
+
 **Parameters:**
 
-- `source`: `str`  
-  The BigQuery table location.
+- `source`: `str` — `project.dataset.table`.
+- `project`: `str | None`, *default* `None`.
+- `columns`: `list[str] | None`, *default* `None` — subset of columns; all columns when omitted.
+- `row_restrictions`: `str | None`, *default* `None` — SQL filter pushed down to BigQuery Storage Read.
+- `worker_type`, `worker_count` — parallel fetch backend.
+- `ipc_exchange`: exchange instance for worker handoff; default `Memory` (threads) or `ArrowIpc` (processes).
+- `batch_size`: `int`, *default* `100` — target rows per internal chunk.
+- `compression`: `None | "lz4" | "zstd"`, *default* `None` — Storage API Arrow compression.
 
-- `project`: `str`, *default* `None`  
-  The BigQuery execution project, also the billing project. If not provided, it will be extracted from `source`.
-
-- `columns`: `str`, *default* `None`  
-  The columns to download. When not provided, all available columns will be downloaded.
-
-- `row_restrictions`: `str`, *default* `None`  
-  Row-level filtering executed on the BigQuery side. More information is available in the [BigQuery documentation](https://cloud.google.com/bigquery/docs/reference/storage/rpc/google.cloud.bigquery.storage.v1beta1).
-
-- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
-  The worker backend for fetching data.
-
-- `worker_count`: `int`, *default* `os.cpu_count()`  
-  The number of threads or processes to use for fetching data from BigQuery.
-
-- `batch_size`: `int`, *default* `100`  
-  The batch size used for fetching. The table will be automatically split into this value.
-
-  
+```python
+table = bq.read_table("my_project.my_dataset.events", columns=["id"], batch_size=500)
+```
 
 #### `pyarrow.bigquery.read_query`
 
-**Parameters:**
+Runs a query and returns the full result as one `pa.Table`. Accepts the same read tuning parameters as `read_table`, plus:
 
-- `project`: `str`  
-  The BigQuery query execution (and billing) project.
-
-- `query`: `str`  
-  The query to be executed.
-
-- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
-  The worker backend for fetching data.
-
-- `worker_count`: `int`, *default* `os.cpu_count()`  
-  The number of threads or processes to use for fetching data from BigQuery.
-
-- `batch_size`: `int`, *default* `100`  
-  The batch size used for fetching. The table will be automatically split into this value.
+- `location`: `str | None` — query job location.
+- `large_results`: `bool`, *default* `False` — materialize to a temp table, then read (deleted on exit).
+- `large_results_dataset`: `str`, *default* `"_temp_pyarrow_bigquery"`.
+- `large_results_expiration_ms`: `int`, *default* `86400000` — dataset default TTL when the dataset is first created.
 
 ```python
-table = bq.read_query("gcp_project", "SELECT * FROM `gcp_project.dataset.table`")
+table = bq.read_query(
+    project="my_project",
+    query="SELECT id FROM `my_project.my_dataset.events` LIMIT 1000",
+    location="US",
+)
 ```
 
+#### `pyarrow.bigquery.reader` (context manager)
 
-#### `pyarrow.bigquery.reader` (Context Manager)
+Streams a table as an iterator of `pa.Table` chunks.
 
-**Parameters:**
+**Parameters:** same as `read_table`.
 
-- `source`: `str`  
-  The BigQuery table location.
+**Attributes:**
 
-- `project`: `str`, *default* `None`  
-  The BigQuery execution project, also the billing project. If not provided, it will be extracted from `source`.
-
-- `columns`: `str`, *default* `None`  
-  The columns to download. When not provided, all available columns will be downloaded.
-
-- `row_restrictions`: `str`, *default* `None`  
-  Row-level filtering executed on the BigQuery side. More information is available in the [BigQuery documentation](https://cloud.google.com/bigquery/docs/reference/storage/rpc/google.cloud.bigquery.storage.v1beta1).
-
-- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
-  The worker backend for fetching data.
-
-- `worker_count`: `int`, *default* `os.cpu_count()`  
-  The number of threads or processes to use for fetching data from BigQuery.
-
-- `batch_size`: `int`, *default* `100`  
-  The batch size used for fetching. The table will be automatically split into this value.
-
-**Attributes:** 
-
-- `schema`: `pa.Schema`   
-  Context manager attribute to provide schema of pyarrow table. Works only when context manager is active (after `__enter__` was called)
-  
+- `schema`: `pa.Schema` — available after `__enter__`.
 
 ```python
-import pyarrow as pa
-import pyarrow.bigquery as bq
-
 parts = []
-
-with bq.reader("gcp_project.dataset.table") as r:
-
+with bq.reader("my_project.my_dataset.events", batch_size=2000) as r:
     print(r.schema)
-
-    for batch in r:
-        parts.append(batch)
-
-table = pa.concat_tables(parts)
+    for chunk in r:
+        parts.append(chunk)
+full = pa.concat_tables(parts) if parts else pa.table({})
 ```
 
-#### `pyarrow.bigquery.reader_query`  (Context Manager)
+#### `pyarrow.bigquery.reader_query` (context manager)
 
-**Parameters:**
-
-- `project`: `str`  
-  The BigQuery query execution (and billing) project.
-
-- `query`: `str`  
-  The query to be executed.
-
-- `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`  
-  The worker backend for fetching data.
-
-- `worker_count`: `int`, *default* `os.cpu_count()`  
-  The number of threads or processes to use for fetching data from BigQuery.
-
-- `batch_size`: `int`, *default* `100`  
-  The batch size used for fetching. The table will be automatically split into this value.
-
-- `large_results`: `bool`, *default* `False`  
-  When `True`, materializes query results into a temporary table (in `large_results_dataset`) and reads from it. The temporary table is deleted when the context manager exits.
-
-- `large_results_dataset`: `str`, *default* `"_temp_pyarrow_bigquery"`  
-  Dataset used for temporary tables when `large_results=True`.
-
-- `large_results_expiration_ms`: `int`, *default* `86400000` (24 hours)  
-  Default table expiration for `large_results_dataset` when it is first created. Does not apply to tables removed on context exit.
-
-
-**Attributes:** 
-
-- `schema`: `pa.Schema`   
-  Context manager attribute to provide schema of pyarrow table. Works only when context manager is active (after `__enter__` was called)
-  
+Runs a query, then streams the result like `reader`. Query-related parameters match `read_query`.
 
 ```python
-with bq.reader_query("gcp_project", "SELECT * FROM `gcp_project.dataset.table`") as r:
-    for batch in r:
-        print(batch.num_rows)
+with bq.reader_query(
+    project="my_project",
+    query="SELECT * FROM `my_project.my_dataset.events`",
+    large_results=True,
+) as r:
+    for chunk in r:
+        print(chunk.num_rows)
 ```
+
+### IPC exchange (`pyarrow.bigquery.exchange`)
+
+Workers pass Arrow tables through a pluggable exchange. Implementations set `thread_compatible` / `process_compatible` flags:
+
+| Class | Threads | Processes | Notes |
+|-------|---------|-----------|--------|
+| `Memory` | yes | no | Default for thread workers |
+| `ArrowIpc` | no | yes | Default for process workers; mmap temp files |
+| `Feather` | no | yes | Feather temp files |
+| `SharedMemory` | no | yes | POSIX shared memory |
+| `SharedMemoryDict` | yes | yes | Slow; mainly for completeness |
+
+```python
+import pyarrow.bigquery.exchange as exchange
+
+with bq.reader(
+    "my_project.my_dataset.t",
+    worker_type=multiprocessing.Process,
+    ipc_exchange=exchange.SharedMemory(),
+) as r:
+    ...
+```
+
+---
+
+## Authentication
+
+The library uses [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials). Ensure the active principal can read/write the target datasets (BigQuery and BigQuery Storage API permissions).
