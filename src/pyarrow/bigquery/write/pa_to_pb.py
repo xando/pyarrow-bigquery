@@ -98,7 +98,7 @@ def generate(schema):
 
     message_type = emit(schema, message_name=message_name)
 
-    pool = descriptor_pool.Default()
+    pool = descriptor_pool.DescriptorPool()
     pool.AddSerializedFile(
         descriptor_pb2.FileDescriptorProto(
             name=file_name, message_type=[message_type]
@@ -129,6 +129,37 @@ def amend_schema(schema):
 
 def serialize(pa_table, protobuf_definition):
     Message = message_factory.GetMessageClass(protobuf_definition)
+    message_fields = list(protobuf_definition.fields)
+
+    def _sanitize_value(field, value):
+        if value is None:
+            return None
+        if field.type != FieldDescriptorProto.TYPE_MESSAGE:
+            return value
+        if field.label == FieldDescriptorProto.LABEL_REPEATED:
+            sanitized_list = []
+            for item in value:
+                sanitized_item = _sanitize_message(item, field.message_type)
+                if sanitized_item is not None:
+                    sanitized_list.append(sanitized_item)
+            return sanitized_list
+        return _sanitize_message(value, field.message_type)
+
+    def _sanitize_message(element, descriptor):
+        if element is None:
+            return None
+        if not isinstance(element, dict):
+            return element
+
+        sanitized = {}
+        for field in descriptor.fields:
+            if field.name not in element:
+                continue
+            sanitized_value = _sanitize_value(field, element[field.name])
+            if sanitized_value is None:
+                continue
+            sanitized[field.name] = sanitized_value
+        return sanitized
 
     pa_table = pa_table.cast(amend_schema(pa_table.schema))
 
@@ -137,7 +168,15 @@ def serialize(pa_table, protobuf_definition):
 
     for element in pa_table.to_pylist():
         t0 = time.time()
-        message = Message(**element)
+        sanitized = {}
+        for field in message_fields:
+            if field.name not in element:
+                continue
+            sanitized_value = _sanitize_value(field, element[field.name])
+            if sanitized_value is None:
+                continue
+            sanitized[field.name] = sanitized_value
+        message = Message(**sanitized)
         size += message.ByteSize()
 
         logger.debug(f"Time taken to serialize: {(time.time() - t0):.4f}")

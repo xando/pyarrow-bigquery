@@ -42,6 +42,18 @@ def _queue_error(exc: BaseException):
     return (_QUEUE_ERROR, (type(exc).__name__, str(exc), traceback.format_exc()))
 
 
+def _close_client_transport(client):
+    if not client:
+        return
+    transport = getattr(client, "transport", None)
+    close = getattr(transport, "close", None)
+    if close:
+        try:
+            close()
+        except Exception:
+            logger.exception("Failed to close BigQuery Storage client transport")
+
+
 def _bq_create_table(*, project, location, schema, expire, overwrite):
     client = bigquery.Client(project=project)
 
@@ -106,14 +118,15 @@ def _bq_storage_close_stream(write_client, stream, parent):
 
 
 def _stream_worker(
-    write_client: bigquery_storage_v1.BigQueryWriteClient,
     parent: str,
     schema_protobuf,
     queue_results,
     queue_worker_status,
 ):
+    write_client = None
     stream = None
     try:
+        write_client = bigquery_storage_v1.BigQueryWriteClient()
         stream = _bq_write_create_stream(write_client, parent, schema_protobuf)
 
         offset = 0
@@ -140,6 +153,7 @@ def _stream_worker(
                 _bq_storage_close_stream(write_client, stream, parent)
             except Exception:
                 logger.exception("Failed to close BigQuery write stream")
+        _close_client_transport(write_client)
 
 
 class writer:
@@ -167,6 +181,11 @@ class writer:
 
         self.worker_count = worker_count
         self.worker_type = worker_type
+        if self.worker_type not in (threading.Thread, multiprocessing.Process):
+            raise ValueError(
+                f"Unsupported worker type {worker_type}, "
+                "expected threading.Thread or multiprocessing.Process"
+            )
 
         project_id, dataset_id, table_id = where.split(".")
 
@@ -179,6 +198,7 @@ class writer:
         self.t0 = time.time()
         self.temp_dir = tempfile.mkdtemp()
         self.schema_protobuf = pa_to_pb.generate(self.schema)
+        queue_maxsize = max(4, self.worker_count * 2)
 
         if self.table_create:
             _bq_create_table(
@@ -190,19 +210,17 @@ class writer:
             )
 
         if self.worker_type == threading.Thread:
-            self.queue_results = queue.Queue()
+            self.queue_results = queue.Queue(maxsize=queue_maxsize)
             self.queue_worker_status = queue.Queue()
         else:
-            self.queue_results = multiprocessing.Queue()
+            self.queue_results = multiprocessing.Queue(maxsize=queue_maxsize)
             self.queue_worker_status = multiprocessing.Queue()
         self.workers = []
-        write_client = bigquery_storage_v1.BigQueryWriteClient()
 
         for _ in range(self.worker_count):
             worker = self.worker_type(
                 target=_stream_worker,
                 args=(
-                    write_client,
                     self.parent,
                     self.schema_protobuf,
                     self.queue_results,
