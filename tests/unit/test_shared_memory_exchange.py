@@ -1,9 +1,18 @@
 import multiprocessing as mp
-import os
+from multiprocessing import shared_memory
 
 import pyarrow as pa
 
 from pyarrow.bigquery.exchange.shared_memory import SharedMemory, _parse_key
+
+
+def _segment_exists(name: str) -> bool:
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+    except FileNotFoundError:
+        return False
+    shm.close()
+    return True
 
 
 def _worker_store(queue: mp.Queue, num_rows: int) -> None:
@@ -31,7 +40,7 @@ def test_shared_memory_load_unlinks_segment():
     exchange = SharedMemory()
     key = exchange.store(pa.table({"x": [1, 2, 3]}))
     name, _ = _parse_key(key)
-    assert os.path.exists(f"/dev/shm/{name}")
+    assert _segment_exists(name)
 
     exchange.load(key)
-    assert not os.path.exists(f"/dev/shm/{name}")
+    assert not _segment_exists(name)
