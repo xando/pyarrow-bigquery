@@ -58,7 +58,7 @@ def _bq_table_exists(project: str, location: str):
         client.get_table(location)
         logger.debug(f"Table {location} indeed exists")
     except NotFound as e:
-        logger.debug("Table {location} is not found")
+        logger.debug(f"Table {location} is not found")
         raise e
 
 

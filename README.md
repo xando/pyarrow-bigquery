@@ -223,7 +223,7 @@ import pyarrow.bigquery as bq
 schema = pa.schema([("value", pa.list_(pa.int64()))])
 
 with bq.writer("gcp_project.dataset.table", schema=schema) as writer:
-    for a in range 1000:
+    for a in range(1000):
         writer.write_batch(pa.RecordBatch.from_pylist([{'value': [1] * 10}]))
 ```
 
