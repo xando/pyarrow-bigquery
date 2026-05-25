@@ -53,13 +53,25 @@ def _close_client_transport(client):
 
 def _bq_table_exists(project: str, location: str):
     client = bigquery.Client(project=project)
-
     try:
         client.get_table(location)
         logger.debug(f"Table {location} indeed exists")
     except NotFound as e:
         logger.debug(f"Table {location} is not found")
         raise e
+    finally:
+        _close_client_transport(client)
+
+
+def _bq_delete_table(project: str, location: str):
+    client = bigquery.Client(project=project)
+    try:
+        client.delete_table(location, not_found_ok=True)
+        logger.debug(f"Deleted table {location}")
+    except Exception:
+        logger.exception(f"Failed to delete table {location}")
+    finally:
+        _close_client_transport(client)
 
 
 def _bq_read_create_streams(
@@ -149,8 +161,10 @@ class reader:
         ipc_exchange: exchange.ConcurrencyCompatible | None = None,
         batch_size: int = 100,
         compression: str | None = None,
+        delete_source_on_exit: bool = False,
     ):
         self.source = source
+        self.delete_source_on_exit = delete_source_on_exit
         self.columns = columns
         self.row_restrictions = row_restrictions
         self.worker_count = worker_count
@@ -292,6 +306,9 @@ class reader:
             if exc_type is None:
                 raise RuntimeError(message)
 
+        if self.delete_source_on_exit:
+            _bq_delete_table(self.project, self.source)
+
         logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
     def __iter__(self):
@@ -360,36 +377,39 @@ def reader_query(
     compression: str | None = None,
 ):
     client = bigquery.Client(project=project, location=location)
+    try:
+        if large_results:
+            dataset = bigquery.Dataset(f"{project}.{large_results_dataset}")
+            dataset.default_table_expiration_ms = large_results_expiration_ms
+            client.create_dataset(dataset, exists_ok=True)
 
-    if large_results:
-        dataset = bigquery.Dataset(f"{project}.{large_results_dataset}")
-        dataset.default_table_expiration_ms = large_results_expiration_ms
-        client.create_dataset(dataset, exists_ok=True)
+            table = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
-        table = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            destination = f"{project}.{large_results_dataset}.{table}"
 
-        destination = f"{project}.{large_results_dataset}.{table}"
+            job_config = bigquery.QueryJobConfig(
+                destination=destination,
+            )
+        else:
+            job_config = bigquery.QueryJobConfig()
 
-        job_config = bigquery.QueryJobConfig(
-            destination=destination,
+        job = client.query(query, job_config=job_config)
+        job.result()
+
+        source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"  # type: ignore
+
+        return reader(
+            source=source,
+            project=project,
+            worker_count=worker_count,
+            worker_type=worker_type,
+            ipc_exchange=ipc_exchange,
+            batch_size=batch_size,
+            compression=compression,
+            delete_source_on_exit=large_results,
         )
-    else:
-        job_config = bigquery.QueryJobConfig()
-
-    job = client.query(query, job_config=job_config)
-    job.result()
-
-    source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"  # type: ignore
-
-    return reader(
-        source=source,
-        project=project,
-        worker_count=worker_count,
-        worker_type=worker_type,
-        ipc_exchange=ipc_exchange,
-        batch_size=batch_size,
-        compression=compression,
-    )
+    finally:
+        _close_client_transport(client)
 
 
 def read_table(

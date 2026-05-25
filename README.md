@@ -346,6 +346,15 @@ table = pa.concat_tables(parts)
 - `batch_size`: `int`, *default* `100`  
   The batch size used for fetching. The table will be automatically split into this value.
 
+- `large_results`: `bool`, *default* `False`  
+  When `True`, materializes query results into a temporary table (in `large_results_dataset`) and reads from it. The temporary table is deleted when the context manager exits.
+
+- `large_results_dataset`: `str`, *default* `"_temp_pyarrow_bigquery"`  
+  Dataset used for temporary tables when `large_results=True`.
+
+- `large_results_expiration_ms`: `int`, *default* `86400000` (24 hours)  
+  Default table expiration for `large_results_dataset` when it is first created. Does not apply to tables removed on context exit.
+
 
 **Attributes:** 
 
