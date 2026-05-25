@@ -1,7 +1,8 @@
 import os
 import tempfile
+import weakref
+
 import pyarrow as pa
-import threading
 import pyarrow.feather as fa
 
 from .base import ConcurrencyCompatible
@@ -9,12 +10,20 @@ from .base import ConcurrencyCompatible
 PREFIX = "pyarrow-bigquery-"
 
 
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 class Feather(ConcurrencyCompatible):
     thread_compatible = True
     process_compatible = True
 
     def store(self, table: pa.Table) -> str:
-        _, file_name = tempfile.mkstemp(prefix=PREFIX)
+        fd, file_name = tempfile.mkstemp(prefix=PREFIX)
+        os.close(fd)
 
         with open(file_name, "wb") as f:
             fa.write_feather(table, f)
@@ -22,7 +31,6 @@ class Feather(ConcurrencyCompatible):
         return file_name
 
     def load(self, key: str) -> pa.Table:
-        with open(key, "rb") as f:
-            table = fa.read_table(f)
-            threading.Thread(target=os.unlink, args=(key,)).start()
-            return table
+        table = fa.read_table(key, memory_map=True)
+        weakref.finalize(table, _unlink, key)
+        return table

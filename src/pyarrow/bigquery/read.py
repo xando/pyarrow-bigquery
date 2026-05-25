@@ -135,7 +135,7 @@ class reader:
             if worker_type == threading.Thread:
                 ipc_exchange = exchange.Memory()
             elif worker_type == multiprocessing.Process:
-                ipc_exchange = exchange.Feather()
+                ipc_exchange = exchange.ArrowIpc()
             else:
                 raise ValueError(
                     f"Unsupported worker type {worker_type}, "
@@ -182,7 +182,11 @@ class reader:
     def __enter__(self):
         self.t0 = time.time()
         self.manager = multiprocessing.Manager()
-        self.queue_results = self.manager.Queue()
+        queue_maxsize = 0
+        if type(self.ipc_exchange) is exchange.SharedMemory:
+            # Limit in-flight shm segments while the main process drains the queue.
+            queue_maxsize = max(4, self.worker_count * 2)
+        self.queue_results = self.manager.Queue(maxsize=queue_maxsize)
         self.read_client = bigquery_storage.BigQueryReadClient()
         self.workers = []
 
