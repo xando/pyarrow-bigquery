@@ -3,6 +3,32 @@
 
 An extension library to **write** to and **read** from BigQuery tables as PyArrow tables.
 
+## Table of Contents
+
+- [Installation](#installation)
+- [Source Code](#source-code)
+- [Quick Start](#quick-start)
+  - [Reading](#reading)
+  - [Writing](#writing)
+- [Examples](#examples)
+  - [Column projection and row filters](#column-projection-and-row-filters)
+  - [Query location and large results](#query-location-and-large-results)
+  - [Parallel workers and IPC exchange](#parallel-workers-and-ipc-exchange)
+  - [Table creation options on write](#table-creation-options-on-write)
+  - [Chunked write with `batch_size`](#chunked-write-with-batch_size)
+- [API Reference](#api-reference)
+  - [Writing](#writing-1)
+    - [`pyarrow.bigquery.write_table`](#pyarrowbigquerywrite_table)
+    - [`pyarrow.bigquery.writer` (context manager)](#pyarrowbigquerywriter-context-manager)
+    - [`pyarrow.bigquery.writer.write_table` / `write_batch`](#pyarrowbigquerywriterwrite_table--write_batch)
+  - [Reading](#reading-1)
+    - [`pyarrow.bigquery.read_table`](#pyarrowbigqueryread_table)
+    - [`pyarrow.bigquery.read_query`](#pyarrowbigqueryread_query)
+    - [`pyarrow.bigquery.reader` (context manager)](#pyarrowbigqueryreader-context-manager)
+    - [`pyarrow.bigquery.reader_query` (context manager)](#pyarrowbigqueryreader_query-context-manager)
+  - [IPC exchange (`pyarrow.bigquery.exchange`)](#ipc-exchange-pyarrowbigqueryexchange)
+- [Authentication](#authentication)
+
 ---
 
 ## Installation
