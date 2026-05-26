@@ -12,6 +12,20 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["abi3-py310"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+prost = "0.13"
+prost-types = "0.13"
+arrow = { version = "53", features = ["pyarrow", "ipc"] }
+bytes = "1"
+gcp_auth = "0.12"
+thiserror = "1"
+futures = "0.3"
+http = "1"
+tower = "0.4"
+
+[build-dependencies]
+tonic-build = { version = "0.12", features = ["prost"] }
 
 [profile.release]
 lto = "thin"

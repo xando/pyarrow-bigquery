@@ -51,9 +51,26 @@ def test_bq_table_exists_closes_transport_on_not_found(monkeypatch):
 
 
 def test_reader_deletes_source_on_exit(monkeypatch):
+    """`delete_source_on_exit=True` triggers `_bq_delete_table` in `__exit__`,
+    regardless of whether iteration happens. Stubs the Rust reader so no
+    actual gRPC connection is made.
+    """
     read_mod = importlib.import_module("pyarrow.bigquery.read")
 
     deleted = []
+
+    class FakePyReader:
+        def __init__(self, *args, **kwargs):
+            self._schema_ipc = pa.schema([("x", pa.int64())]).serialize().to_pybytes()
+
+        def schema_ipc(self):
+            return self._schema_ipc
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise StopIteration
 
     monkeypatch.setattr(
         read_mod,
@@ -61,15 +78,7 @@ def test_reader_deletes_source_on_exit(monkeypatch):
         lambda project, location: deleted.append((project, location)),
     )
     monkeypatch.setattr(read_mod, "_bq_table_exists", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        read_mod,
-        "_bq_read_create_streams",
-        lambda **kwargs: (["stream-1"], pa.schema([("x", pa.int64())])),
-    )
-    def fake_stream_worker(read_streams, table_schema, batch_size, queue_results, ipc_exchange):
-        queue_results.put((read_mod._QUEUE_DONE, None))
-
-    monkeypatch.setattr(read_mod, "_stream_worker", fake_stream_worker)
+    monkeypatch.setattr(read_mod._rust, "PyReader", FakePyReader)
 
     with read_mod.reader(
         "project.dataset.table",
