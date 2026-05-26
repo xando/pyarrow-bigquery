@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "pyarrow-bigquery"
@@ -23,13 +23,19 @@ dependencies = [
 dev = [
     "pytest",
     "ruff",
-    "pdbpp"
+    "pdbpp",
+    "maturin>=1.7,<2.0",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["pyarrow.bigquery*"]  # Important for namespace package
-namespaces = true                # Enable PEP 420 namespace package discovery
+[tool.maturin]
+# Mixed Python + Rust project. Python sources live under src/ as a PEP 420
+# namespace package (pyarrow.bigquery); the compiled extension is published
+# as pyarrow.bigquery._rust.
+manifest-path = "rust/Cargo.toml"
+python-source = "src"
+module-name = "pyarrow.bigquery._rust"
+features = ["pyo3/extension-module"]
+include = [{ path = "rust/**/*", format = "sdist" }]
 
 [tool.ruff]
 exclude = [".git"]
