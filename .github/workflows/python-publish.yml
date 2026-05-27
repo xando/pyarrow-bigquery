@@ -33,6 +33,14 @@ jobs:
           python-version: '3.x'
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # zig's clang (used by maturin-action's default cross-compile path)
+          # does not predefine `__ARM_ARCH` when assembling ring's ARM crypto
+          # code. Pass it through CFLAGS so the .S sources accept the
+          # asm_base.h gate. Harmless on non-ARM targets — only honoured by
+          # the matching toolchain variant.
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
+          CXXFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 3.14
