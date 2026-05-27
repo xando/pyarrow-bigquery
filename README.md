@@ -14,6 +14,7 @@ An extension library to **write** to and **read** from BigQuery tables as PyArro
   - [Column projection and row filters](#column-projection-and-row-filters)
   - [Query location and large results](#query-location-and-large-results)
   - [Parallel workers and IPC exchange](#parallel-workers-and-ipc-exchange)
+  - [Read engines (`engine="python"` vs `"rust"`)](#read-engines-enginepython-vs-rust)
   - [Table creation options on write](#table-creation-options-on-write)
   - [Chunked write with `batch_size`](#chunked-write-with-batch_size)
 - [API Reference](#api-reference)
@@ -186,6 +187,39 @@ with bq.reader(
 
 Thread workers default to `exchange.Memory()`. Other exchanges (`Feather`, `SharedMemory`, …) are available under `pyarrow.bigquery.exchange` for advanced tuning.
 
+`worker_type` / `ipc_exchange` only apply to the Python read engine (the default). See below for the Rust engine, which manages concurrency internally.
+
+### Read engines (`engine="python"` vs `"rust"`)
+
+The read APIs (`read_table`, `read_query`, `reader`, `reader_query`) accept an `engine` parameter selecting which implementation runs the BigQuery Storage Read session.
+
+| `engine` | Default | How it works |
+|---|---|---|
+| `"python"` | ✅ | Spawns a worker pool (threads or processes per `worker_type`) using the `google-cloud-bigquery-storage` Python client; results travel through a configurable `ipc_exchange`. Behaviour is identical to 0.6.x. |
+| `"rust"` |   | Uses the bundled `pyarrow.bigquery._rust` extension: a native `tonic` gRPC client + tokio runtime decodes Arrow IPC and hands batches to Python over the Arrow C Data Interface (no IPC roundtrip, no IPC exchange to configure). |
+
+```python
+# Default — Python worker pool, identical to 0.6.x
+table = bq.read_table("my_project.my_dataset.events")
+
+# Opt-in Rust engine
+table = bq.read_table("my_project.my_dataset.events", engine="rust")
+
+# Works the same way for the streaming context manager
+with bq.reader("my_project.my_dataset.events", engine="rust", batch_size=10_000) as r:
+    for chunk in r:
+        process(chunk)
+```
+
+**With `engine="rust"`:**
+
+- `columns`, `row_restrictions`, `batch_size`, `compression` (`None | "lz4" | "zstd"`), `project`, `delete_source_on_exit` all work the same as in the Python engine.
+- `worker_count` is honoured: it caps the number of read streams the session opens (`max_stream_count = worker_count * 3`, same default as the Python path).
+- `worker_type` and `ipc_exchange` are **ignored** (a warning is emitted if you pass non-default values). The Rust path always uses a single shared tokio runtime; there is no thread/process choice to make and no IPC exchange to serialize through.
+- Authentication uses the same Application Default Credentials chain as the Python client (`gcp_auth` crate under the hood).
+
+**Choosing an engine:** the default is `"python"` because it's the well-tested, in-place implementation. Switch to `"rust"` if you've measured a benefit on your workload and are happy depending on the prebuilt wheel for your platform. Both engines pass the same unit-test suite and return the same row counts.
+
 ### Table creation options on write
 
 ```python
@@ -286,10 +320,11 @@ Loads a full table into memory (`pa.concat_tables` over internal batches).
 - `project`: `str | None`, *default* `None`.
 - `columns`: `list[str] | None`, *default* `None` — subset of columns; all columns when omitted.
 - `row_restrictions`: `str | None`, *default* `None` — SQL filter pushed down to BigQuery Storage Read.
-- `worker_type`, `worker_count` — parallel fetch backend.
-- `ipc_exchange`: exchange instance for worker handoff; default `Memory` (threads) or `ArrowIpc` (processes).
+- `worker_type`, `worker_count` — parallel fetch backend (Python engine only; `worker_count` still caps stream count under the Rust engine).
+- `ipc_exchange`: exchange instance for worker handoff; default `Memory` (threads) or `ArrowIpc` (processes). Ignored when `engine="rust"`.
 - `batch_size`: `int`, *default* `100` — target rows per internal chunk.
 - `compression`: `None | "lz4" | "zstd"`, *default* `None` — Storage API Arrow compression.
+- `engine`: `"python" | "rust"`, *default* `"python"` — implementation selector; see [Read engines](#read-engines-enginepython-vs-rust).
 
 ```python
 table = bq.read_table("my_project.my_dataset.events", columns=["id"], batch_size=500)
@@ -297,7 +332,7 @@ table = bq.read_table("my_project.my_dataset.events", columns=["id"], batch_size
 
 #### `pyarrow.bigquery.read_query`
 
-Runs a query and returns the full result as one `pa.Table`. Accepts the same read tuning parameters as `read_table`, plus:
+Runs a query and returns the full result as one `pa.Table`. Accepts the same read tuning parameters as `read_table` (including `engine`), plus:
 
 - `location`: `str | None` — query job location.
 - `large_results`: `bool`, *default* `False` — materialize to a temp table, then read (deleted on exit).
@@ -316,7 +351,7 @@ table = bq.read_query(
 
 Streams a table as an iterator of `pa.Table` chunks.
 
-**Parameters:** same as `read_table`.
+**Parameters:** same as `read_table` (including `engine`).
 
 **Attributes:**
 
@@ -333,7 +368,7 @@ full = pa.concat_tables(parts) if parts else pa.table({})
 
 #### `pyarrow.bigquery.reader_query` (context manager)
 
-Runs a query, then streams the result like `reader`. Query-related parameters match `read_query`.
+Runs a query, then streams the result like `reader`. Query-related parameters match `read_query` (including `engine`).
 
 ```python
 with bq.reader_query(
