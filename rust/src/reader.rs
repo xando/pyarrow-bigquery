@@ -8,7 +8,8 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use arrow::ipc::reader::StreamReader as ArrowStreamReader;
+use arrow::buffer::Buffer as ArrowBuffer;
+use arrow::ipc::reader::StreamDecoder;
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -160,43 +161,46 @@ async fn stream_worker(
         }
     };
 
+    // One StreamDecoder per worker: feed the schema bytes once, then each
+    // gRPC message's record-batch bytes. Avoids the per-message allocate +
+    // schema-prepend + StreamReader-construction overhead that dominated at
+    // ~1 batch/MB of data for large reads.
+    let mut decoder = StreamDecoder::new();
+    let schema_slice: &[u8] = schema_ipc.as_ref();
+    let mut schema_buf = ArrowBuffer::from(schema_slice);
+    if let Err(e) = decoder.decode(&mut schema_buf) {
+        let _ = tx
+            .send(Err(format!("arrow ipc schema decode: {e}")))
+            .await;
+        return;
+    }
+
     while let Some(msg) = stream.next().await {
-        match msg {
-            Ok(response) => {
-                let Some(rows) = response.rows else { continue };
-                use crate::proto::bqstorage_v1::read_rows_response::Rows;
-                let Rows::ArrowRecordBatch(batch_msg) = rows else { continue };
-                // Concatenate schema + batch bytes into an Arrow IPC stream so
-                // we can use StreamReader (which understands continuation/EOS).
-                let mut buf = Vec::with_capacity(
-                    schema_ipc.len() + batch_msg.serialized_record_batch.len(),
-                );
-                buf.extend_from_slice(&schema_ipc);
-                buf.extend_from_slice(&batch_msg.serialized_record_batch);
-                let cursor = std::io::Cursor::new(buf);
-                let reader = match ArrowStreamReader::try_new(cursor, None) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("arrow ipc open: {e}"))).await;
-                        return;
-                    }
-                };
-                for batch in reader {
-                    let batch = match batch {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("arrow ipc decode: {e}"))).await;
-                            return;
-                        }
-                    };
+        let response = match msg {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(format!("ReadRows stream: {e}"))).await;
+                return;
+            }
+        };
+        let Some(rows) = response.rows else { continue };
+        use crate::proto::bqstorage_v1::read_rows_response::Rows;
+        let Rows::ArrowRecordBatch(batch_msg) = rows else { continue };
+
+        let batch_slice: &[u8] = batch_msg.serialized_record_batch.as_ref();
+        let mut buf = ArrowBuffer::from(batch_slice);
+        while !buf.is_empty() {
+            match decoder.decode(&mut buf) {
+                Ok(Some(batch)) => {
                     if tx.send(Ok(batch)).await.is_err() {
                         return;
                     }
                 }
-            }
-            Err(e) => {
-                let _ = tx.send(Err(format!("ReadRows stream: {e}"))).await;
-                return;
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("arrow ipc decode: {e}"))).await;
+                    return;
+                }
             }
         }
     }
