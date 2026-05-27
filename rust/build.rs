@@ -4,6 +4,12 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // CI runners and many dev machines don't have `protoc` on PATH. Pin to
+    // the precompiled binary shipped by `protoc-bin-vendored` so the build
+    // is reproducible across Linux/macOS/Windows without an external dep.
+    let protoc = protoc_bin_vendored::protoc_bin_path()?;
+    std::env::set_var("PROTOC", protoc);
+
     let proto_root = PathBuf::from("proto");
 
     let protos: &[&str] = &[

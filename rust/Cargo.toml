@@ -26,6 +26,7 @@ tower = "0.4"
 
 [build-dependencies]
 tonic-build = { version = "0.12", features = ["prost"] }
+protoc-bin-vendored = "3"
 
 [profile.release]
 lto = "thin"
