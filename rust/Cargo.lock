@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "pyarrow_bigquery_rs"
-version = "0.6.7"
+version = "0.7.0"
 dependencies = [
  "arrow",
  "bytes",
