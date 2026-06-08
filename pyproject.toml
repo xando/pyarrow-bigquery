@@ -36,6 +36,7 @@ python-source = "src"
 module-name = "pyarrow.bigquery._rust"
 features = ["pyo3/extension-module"]
 include = [{ path = "rust/**/*", format = "sdist" }]
+exclude = ["uv.lock"]
 
 [tool.ruff]
 exclude = [".git"]

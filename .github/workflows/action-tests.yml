@@ -37,7 +37,7 @@ jobs:
     # An editable install only adds src/ to sys.path, which doesn't extend
     # pyarrow's __path__ because pyarrow is a regular package, not PEP 420.
     - name: Sync dependencies
-      run: uv sync --python ${{ matrix.python-version }} --no-editable
+      run: uv sync --locked --python ${{ matrix.python-version }} --no-editable
 
     - name: Lint with ruff
       run: uv run --no-sync --python ${{ matrix.python-version }} ruff check
