@@ -1,9 +1,8 @@
 // Skeleton for the Rust-side BigQuery Storage Read POC.
 //
 // Wires together gRPC + auth + Arrow IPC decode. Exposed to Python as the
-// `_rust.PyReader` class. Iteration yields one `pyarrow.RecordBatch` per
-// decoded message from the stream — the Python layer is responsible for any
-// rebatching to a target row count.
+// `_rust.PyReader` class. Iteration yields groups of decoded
+// `pyarrow.RecordBatch` objects drained from the Rust channel.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -16,8 +15,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration};
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -36,6 +37,8 @@ use crate::proto::bqstorage_v1::{
 
 const BQ_STORAGE_ENDPOINT: &str = "https://bigquerystorage.googleapis.com";
 const SCOPE: &[&str] = &["https://www.googleapis.com/auth/bigquery.readonly"];
+const MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
+const MAX_READ_ROWS_RETRIES: usize = 3;
 
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -66,7 +69,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
 type AuthedClient =
     BigQueryReadClient<InterceptedService<Channel, AuthInterceptor>>;
 
-async fn build_client() -> Result<AuthedClient, String> {
+async fn fetch_token() -> Result<Arc<str>, String> {
     let provider = gcp_auth::provider()
         .await
         .map_err(|e| format!("gcp auth: {e}"))?;
@@ -74,8 +77,10 @@ async fn build_client() -> Result<AuthedClient, String> {
         .token(SCOPE)
         .await
         .map_err(|e| format!("token fetch: {e}"))?;
-    let token_str: Arc<str> = Arc::from(token.as_str());
+    Ok(Arc::from(token.as_str()))
+}
 
+async fn build_client_with_token(token_str: Arc<str>) -> Result<AuthedClient, String> {
     let tls = ClientTlsConfig::new().with_native_roots();
     let channel = Endpoint::from_static(BQ_STORAGE_ENDPOINT)
         .tls_config(tls)
@@ -87,7 +92,8 @@ async fn build_client() -> Result<AuthedClient, String> {
     Ok(BigQueryReadClient::with_interceptor(
         channel,
         AuthInterceptor { token: token_str },
-    ))
+    )
+    .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE))
 }
 
 fn compression_from_str(s: Option<&str>) -> CompressionCodec {
@@ -144,23 +150,11 @@ async fn create_session(
 }
 
 async fn stream_worker(
-    mut client: AuthedClient,
+    token: Arc<str>,
     stream_name: String,
     schema_ipc: Bytes,
     tx: mpsc::Sender<Result<RecordBatch, String>>,
 ) {
-    let req = ReadRowsRequest {
-        read_stream: stream_name,
-        offset: 0,
-    };
-    let mut stream = match client.read_rows(req).await {
-        Ok(s) => s.into_inner(),
-        Err(e) => {
-            let _ = tx.send(Err(format!("ReadRows: {e}"))).await;
-            return;
-        }
-    };
-
     // One StreamDecoder per worker: feed the schema bytes once, then each
     // gRPC message's record-batch bytes. Avoids the per-message allocate +
     // schema-prepend + StreamReader-construction overhead that dominated at
@@ -175,40 +169,85 @@ async fn stream_worker(
         return;
     }
 
-    while let Some(msg) = stream.next().await {
-        let response = match msg {
-            Ok(r) => r,
+    let mut offset = 0_i64;
+    let mut retry_count = 0_usize;
+
+    'read_attempt: loop {
+        let mut client = match build_client_with_token(token.clone()).await {
+            Ok(client) => client,
             Err(e) => {
-                let _ = tx.send(Err(format!("ReadRows stream: {e}"))).await;
+                let _ = tx.send(Err(format!("client: {e}"))).await;
                 return;
             }
         };
-        let Some(rows) = response.rows else { continue };
-        use crate::proto::bqstorage_v1::read_rows_response::Rows;
-        let Rows::ArrowRecordBatch(batch_msg) = rows else { continue };
 
-        let batch_slice: &[u8] = batch_msg.serialized_record_batch.as_ref();
-        let mut buf = ArrowBuffer::from(batch_slice);
-        while !buf.is_empty() {
-            match decoder.decode(&mut buf) {
-                Ok(Some(batch)) => {
-                    if tx.send(Ok(batch)).await.is_err() {
+        let req = ReadRowsRequest {
+            read_stream: stream_name.clone(),
+            offset,
+        };
+        let mut stream = match client.read_rows(req).await {
+            Ok(s) => s.into_inner(),
+            Err(e) => {
+                if retry_count < MAX_READ_ROWS_RETRIES {
+                    retry_count += 1;
+                    sleep(Duration::from_millis(250 * retry_count as u64)).await;
+                    continue 'read_attempt;
+                }
+
+                let _ = tx.send(Err(format!("ReadRows: {e}"))).await;
+                return;
+            }
+        };
+
+        while let Some(msg) = stream.next().await {
+            let response = match msg {
+                Ok(r) => {
+                    retry_count = 0;
+                    r
+                }
+                Err(e) => {
+                    if retry_count < MAX_READ_ROWS_RETRIES {
+                        retry_count += 1;
+                        sleep(Duration::from_millis(250 * retry_count as u64)).await;
+                        continue 'read_attempt;
+                    }
+
+                    let _ = tx.send(Err(format!("ReadRows stream: {e}"))).await;
+                    return;
+                }
+            };
+            let Some(rows) = response.rows else { continue };
+            use crate::proto::bqstorage_v1::read_rows_response::Rows;
+            let Rows::ArrowRecordBatch(batch_msg) = rows else { continue };
+
+            let batch_slice: &[u8] = batch_msg.serialized_record_batch.as_ref();
+            let mut buf = ArrowBuffer::from(batch_slice);
+            while !buf.is_empty() {
+                match decoder.decode(&mut buf) {
+                    Ok(Some(batch)) => {
+                        offset += batch.num_rows() as i64;
+
+                        if tx.send(Ok(batch)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("arrow ipc decode: {e}"))).await;
                         return;
                     }
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    let _ = tx.send(Err(format!("arrow ipc decode: {e}"))).await;
-                    return;
-                }
             }
         }
+
+        break;
     }
 }
 
 #[pyclass(module = "pyarrow.bigquery._rust", unsendable)]
 pub struct PyReader {
     rx: Option<mpsc::Receiver<Result<RecordBatch, String>>>,
+    batch_size: usize,
     schema_ipc: Vec<u8>,
 }
 
@@ -228,6 +267,7 @@ impl PyReader {
         row_restrictions=None,
         max_stream_count=10,
         compression=None,
+        batch_size=100,
         channel_capacity=64,
     ))]
     fn new(
@@ -238,6 +278,7 @@ impl PyReader {
         row_restrictions: Option<String>,
         max_stream_count: i32,
         compression: Option<String>,
+        batch_size: usize,
         channel_capacity: usize,
     ) -> PyResult<Self> {
         let parts: Vec<&str> = source.splitn(3, '.').collect();
@@ -253,9 +294,10 @@ impl PyReader {
         let compression = compression_from_str(compression.as_deref());
 
         let rt = runtime();
-        let (schema_ipc, streams, client) = py.allow_threads(|| {
+        let (schema_ipc, streams, token) = py.allow_threads(|| {
             rt.block_on(async {
-                let mut client = build_client().await?;
+                let token = fetch_token().await?;
+                let mut client = build_client_with_token(token.clone()).await?;
                 let session = create_session(
                     &mut client,
                     &project,
@@ -276,7 +318,7 @@ impl PyReader {
                 };
                 let streams: Vec<String> =
                     session.streams.into_iter().map(|s| s.name).collect();
-                Ok::<_, String>((schema_ipc, streams, client))
+                Ok::<_, String>((schema_ipc, streams, token))
             })
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -292,13 +334,14 @@ impl PyReader {
         for stream_name in streams {
             let tx = tx.clone();
             let schema = schema_bytes.clone();
-            let client = client.clone();
-            rt.spawn(stream_worker(client, stream_name, schema, tx));
+            let token = token.clone();
+            rt.spawn(stream_worker(token, stream_name, schema, tx));
         }
         drop(tx);
 
         Ok(PyReader {
             rx: Some(rx),
+            batch_size,
             schema_ipc,
         })
     }
@@ -312,7 +355,7 @@ impl PyReader {
         slf
     }
 
-    /// Pop the next decoded `pyarrow.RecordBatch`, blocking until one is
+    /// Pop the next decoded `pyarrow.RecordBatch` group, blocking until one is
     /// available or all workers have finished.
     fn __next__(&mut self, py: Python<'_>) -> PyResult<PyObject> {
         let Some(rx) = self.rx.as_mut() else {
@@ -325,7 +368,27 @@ impl PyReader {
                 Err(PyStopIteration::new_err(()))
             }
             Some(Err(e)) => Err(PyRuntimeError::new_err(e)),
-            Some(Ok(batch)) => batch.to_pyarrow(py),
+            Some(Ok(batch)) => {
+                let mut batches = vec![batch];
+                let mut rows = batches[0].num_rows();
+                while rows < self.batch_size {
+                    match rx.try_recv() {
+                        Ok(Ok(batch)) => {
+                            rows += batch.num_rows();
+                            batches.push(batch);
+                        }
+                        Ok(Err(e)) => return Err(PyRuntimeError::new_err(e)),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                let list = PyList::empty_bound(py);
+                for batch in batches {
+                    list.append(batch.to_pyarrow(py)?)?;
+                }
+                Ok(list.into())
+            }
         }
     }
 }

@@ -345,8 +345,9 @@ class reader:
             self.project,
             columns=self.columns,
             row_restrictions=self.row_restrictions,
-            max_stream_count=self.worker_count * 3,
+            max_stream_count=self.worker_count,
             compression=self.compression,
+            batch_size=self.batch_size,
         )
         self.schema = pa.ipc.read_schema(pa.py_buffer(self._rust_reader.schema_ipc()))
         self._rust_pending: list[pa.RecordBatch] = []
@@ -418,12 +419,12 @@ class reader:
     def _next_rust(self) -> pa.Table:
         while not self._rust_exhausted and self._rust_pending_rows < self.batch_size:
             try:
-                batch = next(self._rust_reader)
+                batches = next(self._rust_reader)
             except StopIteration:
                 self._rust_exhausted = True
                 break
-            self._rust_pending.append(batch)
-            self._rust_pending_rows += batch.num_rows
+            self._rust_pending.extend(batches)
+            self._rust_pending_rows += sum(batch.num_rows for batch in batches)
 
         if not self._rust_pending:
             raise StopIteration
