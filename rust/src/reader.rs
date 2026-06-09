@@ -5,7 +5,6 @@
 // `pyarrow.RecordBatch` objects drained from the Rust channel.
 
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use arrow::buffer::Buffer as ArrowBuffer;
 use arrow::ipc::reader::StreamDecoder;
@@ -40,15 +39,12 @@ const SCOPE: &[&str] = &["https://www.googleapis.com/auth/bigquery.readonly"];
 const MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
 const MAX_READ_ROWS_RETRIES: usize = 3;
 
-fn runtime() -> &'static Runtime {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("pyarrow-bigquery-rs")
-            .build()
-            .expect("failed to build tokio runtime")
-    })
+fn build_runtime() -> Result<Runtime, String> {
+    Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("pyarrow-bigquery-rs")
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))
 }
 
 #[derive(Clone)]
@@ -249,6 +245,7 @@ pub struct PyReader {
     rx: Option<mpsc::Receiver<Result<RecordBatch, String>>>,
     batch_size: usize,
     schema_ipc: Vec<u8>,
+    _runtime: Runtime,
 }
 
 #[pymethods]
@@ -293,7 +290,7 @@ impl PyReader {
         );
         let compression = compression_from_str(compression.as_deref());
 
-        let rt = runtime();
+        let rt = build_runtime().map_err(PyRuntimeError::new_err)?;
         let (schema_ipc, streams, token) = py.allow_threads(|| {
             rt.block_on(async {
                 let token = fetch_token().await?;
@@ -343,6 +340,7 @@ impl PyReader {
             rx: Some(rx),
             batch_size,
             schema_ipc,
+            _runtime: rt,
         })
     }
 
