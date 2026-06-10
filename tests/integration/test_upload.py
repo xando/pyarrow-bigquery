@@ -65,6 +65,32 @@ def test_context(LOCATION):
     assert table_back.sort_by("test").equals(table.sort_by("test"))
 
 
+@pytest.mark.parametrize("engine", ["python", "rust"])
+def test_read_table_empty_preserves_schema(LOCATION, engine):
+    table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
+
+    bq.write_table(table, LOCATION, table_create=True)
+
+    table_back = bq.read_table(LOCATION, row_restrictions="test = -1", engine=engine)
+
+    assert table_back.num_rows == 0
+    assert table_back.schema == table.schema
+
+
+@pytest.mark.parametrize("engine", ["python", "rust"])
+def test_read_query_empty_preserves_schema(LOCATION, engine):
+    table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
+
+    bq.write_table(table, LOCATION, table_create=True)
+
+    query = f"SELECT * FROM `{LOCATION}` WHERE test = -1"
+
+    table_back = bq.read_query(project=PROJECT, query=query, engine=engine)
+
+    assert table_back.num_rows == 0
+    assert table_back.schema == table.schema
+
+
 def test_complex(LOCATION):
     _1d_int = pa.array([1, 2])
     _2d_int = pa.array([[1, 2, 3], [4, 5, 6]])

@@ -147,6 +147,10 @@ table = bq.read_table(
 
 The same options work on `reader`, `read_query`, and `reader_query`.
 
+When `row_restrictions` (or the table itself) matches no rows, `read_table` and
+`read_query` return a zero-row `pa.Table` that still carries the BigQuery
+schema, so downstream code can rely on the columns being present.
+
 ### Query location and large results
 
 Pass `location` when the query must run in a specific region. For very large query outputs, materialize into a temporary table and read via the Storage API:
