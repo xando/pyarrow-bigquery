@@ -312,8 +312,11 @@ class reader:
 
         self.workers_done = 0
 
-        assert self.streams, "No streams to read, Table might be empty"
-
+        # BigQuery returns zero streams when `row_restrictions` (or the table
+        # itself) matches no rows. The read session still carries the table
+        # schema, so we keep `self.schema` and simply start no workers; the
+        # reader then yields nothing and callers can fall back to an empty
+        # table that preserves the schema.
         self.actual_worker_count = min(self.worker_count, len(self.streams))
 
         logger.debug(
@@ -321,7 +324,12 @@ class reader:
         )
         logger.debug(f"Actual worker count: {self.actual_worker_count}")
 
-        for read_streams in some_itertools.to_split(self.streams, self.actual_worker_count):
+        worker_splits = (
+            some_itertools.to_split(self.streams, self.actual_worker_count)
+            if self.actual_worker_count
+            else ()
+        )
+        for read_streams in worker_splits:
             worker = self.worker_type(
                 target=_stream_worker,
                 args=(
@@ -387,6 +395,9 @@ class reader:
         raise RuntimeError(f"Unexpected BigQuery read worker message: {(kind, payload)!r}")
 
     def _next_python(self):
+        if self.actual_worker_count == 0:
+            # No streams were created (empty result set); nothing to yield.
+            raise StopIteration
         while True:
             try:
                 element = self.queue_results.get(timeout=_QUEUE_GET_TIMEOUT)
@@ -557,7 +568,13 @@ def read_table(
         compression=compression,
         engine=engine,
     ) as r:
-        return pa.concat_tables(r)
+        tables = list(r)
+        if tables:
+            return pa.concat_tables(tables)
+        # Empty result set (e.g. a `row_restrictions` that matches no rows).
+        # Return a zero-row table that still carries the BigQuery schema
+        # instead of raising or dropping the schema.
+        return r.schema.empty_table()
 
 
 def read_query(
@@ -589,4 +606,8 @@ def read_query(
         compression=compression,
         engine=engine,
     ) as r:
-        return pa.concat_tables(r)
+        tables = list(r)
+        if tables:
+            return pa.concat_tables(tables)
+        # Empty result set: preserve the schema with a zero-row table.
+        return r.schema.empty_table()
