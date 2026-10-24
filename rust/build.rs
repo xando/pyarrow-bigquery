@@ -1,5 +1,5 @@
-// Compile the vendored BigQuery Storage v1 protos. Only the Read service is
-// used at runtime; we build the client side and skip server generation.
+// Compile the vendored BigQuery Storage Read and Write v1 clients.
+// Server generation is not needed by the Python extension.
 
 use std::path::PathBuf;
 

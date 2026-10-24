@@ -15,6 +15,7 @@ An extension library to **write** to and **read** from BigQuery tables as PyArro
   - [Query location and large results](#query-location-and-large-results)
   - [Parallel workers and IPC exchange](#parallel-workers-and-ipc-exchange)
   - [Read engines (`engine="python"` vs `"rust"`)](#read-engines-enginepython-vs-rust)
+  - [Write engines (`engine="python"` vs `"rust"`)](#write-engines-enginepython-vs-rust)
   - [Table creation options on write](#table-creation-options-on-write)
   - [Chunked write with `batch_size`](#chunked-write-with-batch_size)
 - [API Reference](#api-reference)
@@ -224,6 +225,45 @@ with bq.reader("my_project.my_dataset.events", engine="rust", batch_size=10_000)
 
 **Choosing an engine:** the default is `"python"` because it's the well-tested, in-place implementation. Switch to `"rust"` if you've measured a benefit on your workload and are happy depending on the prebuilt wheel for your platform. Both engines pass the same unit-test suite and return the same row counts.
 
+### Write engines (`engine="python"` vs `"rust"`)
+
+The write APIs accept the same engine selector as reads. The default
+`engine="python"` keeps the existing Python workers and protobuf upload path.
+`engine="rust"` uses the bundled extension to import Arrow batches directly,
+encode Arrow IPC, and manage the Storage Write API connections:
+
+```python
+bq.write_table(table, "my_project.my_dataset.events", engine="rust")
+
+with bq.writer(table.schema, "my_project.my_dataset.events",
+               engine="rust", table_create=False, worker_count=4) as w:
+    w.write_table(table)
+    # w.write_batch(record_batch) also works.
+```
+
+`project`, `table_create`, `table_expire`, `table_overwrite`, and `batch_size`
+retain their existing meanings. `worker_count` limits the native write streams;
+`worker_type` is ignored by Rust, with a warning for non-default values. The Rust
+path uses bounded queues and does not create temporary Feather files or Python
+worker threads/processes.
+
+Rust writes use pending streams. A successful context exit waits for all appends,
+finalizes the streams, and commits them together. A write failure or exception in
+the context prevents that commit. Table creation and overwrite happen separately
+and are not rolled back. As with other remote commits, an error receiving the
+commit response can leave its outcome uncertain.
+
+The Rust engine validates schema support before creating or overwriting a table.
+It normalizes timestamps to UTC microseconds (naive timestamps are interpreted as
+UTC), whole-day Date64 values to Date32, and null lists to empty lists. Null
+records inside lists are omitted; null scalar list elements are rejected.
+Decimal128 requires at most nine fractional digits and 29 integer digits and is
+normalized to NUMERIC. Conversions that would lose precision or overflow raise
+an error. Time-of-day arrays, Decimal256, dictionary arrays, and direct nested
+lists are unsupported; use `engine="python"` where it supports the input, or
+convert to a supported type. Batches are split to fit the
+Storage Write API request limit; a single oversized row raises an error.
+
 ### Table creation options on write
 
 ```python
@@ -278,6 +318,8 @@ Writes a PyArrow table to BigQuery. Returns nothing.
 - `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`.
 - `worker_count`: `int`, *default* `os.cpu_count()`.
 - `batch_size`: `int`, *default* `10` — rows per upload chunk inside the call.
+- `engine`: `"python" | "rust"`, *default* `"python"` — implementation selector;
+  see [Write engines](#write-engines-enginepython-vs-rust).
 
 ```python
 bq.write_table(table, "my_project.my_dataset.out")
@@ -287,7 +329,8 @@ bq.write_table(table, "my_project.my_dataset.out")
 
 Incremental writes. Constructor: `writer(schema, where, **options)`.
 
-**Parameters:** same table-creation and worker options as `write_table` (no `batch_size` on the context manager itself).
+**Parameters:** same table-creation, worker, and `engine` options as `write_table`
+(no `batch_size` on the context manager itself).
 
 **Methods:**
 

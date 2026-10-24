@@ -11,6 +11,8 @@ import tempfile
 import logging
 import collections
 import traceback
+import warnings
+from typing import Literal
 
 
 from google.cloud import bigquery
@@ -26,9 +28,11 @@ import pyarrow.feather as fa
 from . import pa_to_bq
 from . import pa_to_pb
 from . import upload
-from .. import some_itertools
+from .. import _rust, some_itertools
 
 logger = logging.getLogger(__name__)
+
+_ENGINES = ("python", "rust")
 
 _QUEUE_DONE = "done"
 _QUEUE_ERROR = "error"
@@ -55,12 +59,11 @@ def _close_client_transport(client):
 
 
 def _bq_create_table(*, project, location, schema, expire, overwrite):
+    bq_schema = pa_to_bq.generate(schema)
     client = bigquery.Client(project=project)
 
     if overwrite:
         client.delete_table(location, not_found_ok=True)
-
-    bq_schema = pa_to_bq.generate(schema)
 
     table = bigquery.Table(location, schema=bq_schema)
 
@@ -157,7 +160,13 @@ def _stream_worker(
 
 
 class writer:
-    """Method to handle"""
+    """Stream Arrow data to BigQuery using Python or Rust workers.
+
+    ``engine="python"`` preserves the Python worker pool. ``engine="rust"``
+    passes batches to the bundled extension over the Arrow C Data Interface;
+    ``worker_count`` controls native streams and ``worker_type`` is ignored.
+    Rust writes are committed together when the context exits successfully.
+    """
 
     def __init__(
         self,
@@ -170,10 +179,22 @@ class writer:
         table_overwrite: bool = False,
         worker_count: int = multiprocessing.cpu_count(),
         worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
+        engine: Literal["python", "rust"] = "python",
     ):
+        if engine not in _ENGINES:
+            raise ValueError(
+                f"Unsupported engine {engine!r}, expected one of {_ENGINES}"
+            )
+        if engine == "rust" and (
+            not isinstance(worker_count, int) or worker_count < 1
+        ):
+            raise ValueError("worker_count must be a positive integer for engine=\"rust\"")
+
         self.project = project
         self.where = where
         self.schema = schema
+        self.engine = engine
+        self._rust_writer = None
 
         self.table_create = table_create
         self.table_expire = table_expire
@@ -186,6 +207,12 @@ class writer:
                 f"Unsupported worker type {worker_type}, "
                 "expected threading.Thread or multiprocessing.Process"
             )
+        if engine == "rust" and worker_type is not threading.Thread:
+            warnings.warn(
+                '`worker_type` is ignored when `engine="rust"`: '
+                "the Rust path manages concurrency internally.",
+                stacklevel=2,
+            )
 
         project_id, dataset_id, table_id = where.split(".")
 
@@ -196,6 +223,9 @@ class writer:
 
     def __enter__(self):
         self.t0 = time.time()
+        if self.engine == "rust":
+            return self._enter_rust()
+
         self.temp_dir = tempfile.mkdtemp()
         self.schema_protobuf = pa_to_pb.generate(self.schema)
         queue_maxsize = max(4, self.worker_count * 2)
@@ -234,12 +264,55 @@ class writer:
 
         return self
 
+    def _enter_rust(self):
+        if self._rust_writer is not None:
+            raise RuntimeError("BigQuery writer is already open")
+        # The native constructor validates the schema without opening streams.
+        # Do this before table_overwrite can delete the destination table.
+        rust_writer = _rust.PyWriter(
+            parent=self.parent,
+            schema=self.schema,
+            worker_count=self.worker_count,
+        )
+        try:
+            if self.table_create:
+                _bq_create_table(
+                    project=self.project,
+                    location=self.where,
+                    schema=self.schema,
+                    expire=self.table_expire,
+                    overwrite=self.table_overwrite,
+                )
+        except BaseException:
+            try:
+                rust_writer.close(commit=False)
+            except Exception:
+                logger.exception("Failed to close Rust BigQuery writer after setup failure")
+            raise
+        self._rust_writer = rust_writer
+        return self
+
+    def _open_rust_writer(self):
+        if self._rust_writer is None:
+            raise RuntimeError("BigQuery writer is not open; use it inside a with block")
+        return self._rust_writer
+
     def write_table(self, table):
+        if self.engine == "rust":
+            rust_writer = self._open_rust_writer()
+            for batch in table.to_batches():
+                rust_writer.write_batch(batch)
+            return
+
         element = tempfile.mktemp(dir=self.temp_dir)
         fa.write_feather(table, element)
         self.queue_results.put(element)
 
     def write_batch(self, batch):
+        if self.engine == "rust":
+            self._open_rust_writer().write_batch(batch)
+            return
+
         element = tempfile.mktemp(dir=self.temp_dir)
         fa.write_feather(pa.Table.from_batches([batch]), element)
         self.queue_results.put(element)
@@ -282,6 +355,11 @@ class writer:
             workers_done = self._process_worker_status(kind, payload, workers_done)
 
     def __exit__(self, exc_type, *_):
+        if self.engine == "rust":
+            self._exit_rust(exc_type)
+            logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
+            return
+
         for _ in range(self.worker_count):
             self.queue_results.put(None)
 
@@ -311,6 +389,18 @@ class writer:
 
         logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
+    def _exit_rust(self, exc_type):
+        rust_writer = self._rust_writer
+        self._rust_writer = None
+        if rust_writer is None:
+            return
+        try:
+            rust_writer.close(commit=exc_type is None)
+        except Exception:
+            if exc_type is None:
+                raise
+            logger.exception("Failed to close Rust BigQuery writer during exception cleanup")
+
 
 def write_table(
     table: pa.Table,
@@ -323,6 +413,7 @@ def write_table(
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     batch_size: int = 10,
+    engine: Literal["python", "rust"] = "python",
 ):
     assert table.num_rows > 0, "Table is empty"
 
@@ -335,6 +426,7 @@ def write_table(
         table_overwrite=table_overwrite,
         worker_count=worker_count,
         worker_type=worker_type,
+        engine=engine,
     ) as w:
         for table_chunk in some_itertools.to_chunks(table, batch_size):
             w.write_table(table_chunk)

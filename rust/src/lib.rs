@@ -4,6 +4,8 @@ use pyo3::prelude::*;
 
 mod proto;
 mod reader;
+mod writer;
+mod writer_schema;
 
 #[pyfunction]
 fn build_info() -> &'static str {
@@ -14,5 +16,6 @@ fn build_info() -> &'static str {
 fn _rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_info, m)?)?;
     m.add_class::<reader::PyReader>()?;
+    m.add_class::<writer::PyWriter>()?;
     Ok(())
 }
