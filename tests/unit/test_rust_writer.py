@@ -3,8 +3,7 @@
 import pyarrow as pa
 import pytest
 
-from pyarrow.bigquery import _rust
-
+import pyarrow.bigquery._rust as _rust
 
 PARENT = "projects/offline-project/datasets/dataset/tables/table"
 

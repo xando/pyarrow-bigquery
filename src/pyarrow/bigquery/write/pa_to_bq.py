@@ -1,9 +1,8 @@
 import pyarrow as pa
-
 from google.cloud import bigquery
 
-from .type_mapping import TYPES_MAPPING
 from ..some_itertools import first
+from .type_mapping import TYPES_MAPPING
 
 
 def emit(schema):

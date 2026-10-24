@@ -1,14 +1,14 @@
 import logging
-import time
 import random
 import string
-
-from google.protobuf.descriptor_pb2 import DescriptorProto, FieldDescriptorProto
-from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+import time
 
 import pyarrow as pa
-from .type_mapping import TYPES_MAPPING
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+from google.protobuf.descriptor_pb2 import DescriptorProto, FieldDescriptorProto
+
 from ..some_itertools import first
+from .type_mapping import TYPES_MAPPING
 
 logger = logging.getLogger(__name__)
 

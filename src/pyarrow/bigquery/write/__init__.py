@@ -1,34 +1,29 @@
 from __future__ import annotations
 
+import collections
+import datetime
+import logging
+import multiprocessing
 import os
 import queue
-import time
-import datetime
-import multiprocessing
-import threading
 import shutil
 import tempfile
-import logging
-import collections
+import threading
+import time
 import traceback
 import warnings
 from typing import Literal
 
-
-from google.cloud import bigquery
-from google.cloud import bigquery_storage_v1
-from google.cloud.bigquery_storage_v1.writer import AppendRowsStream
-from google.protobuf import descriptor_pb2
-from google.api_core.exceptions import Unknown, NotFound
-from google.api_core import retry
-
 import pyarrow as pa
 import pyarrow.feather as fa
+from google.api_core import retry
+from google.api_core.exceptions import NotFound, Unknown
+from google.cloud import bigquery, bigquery_storage_v1
+from google.cloud.bigquery_storage_v1.writer import AppendRowsStream
+from google.protobuf import descriptor_pb2
 
-from . import pa_to_bq
-from . import pa_to_pb
-from . import upload
 from .. import _rust, some_itertools
+from . import pa_to_bq, pa_to_pb, upload
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +299,8 @@ class writer:
                 rust_writer.write_batch(batch)
             return
 
-        element = tempfile.mktemp(dir=self.temp_dir)
+        fd, element = tempfile.mkstemp(dir=self.temp_dir)
+        os.close(fd)
         fa.write_feather(table, element)
         self.queue_results.put(element)
 
@@ -313,7 +309,8 @@ class writer:
             self._open_rust_writer().write_batch(batch)
             return
 
-        element = tempfile.mktemp(dir=self.temp_dir)
+        fd, element = tempfile.mkstemp(dir=self.temp_dir)
+        os.close(fd)
         fa.write_feather(pa.Table.from_batches([batch]), element)
         self.queue_results.put(element)
 

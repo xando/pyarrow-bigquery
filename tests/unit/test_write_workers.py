@@ -50,7 +50,35 @@ def test_writer_validates_worker_type():
     write_mod = importlib.import_module("pyarrow.bigquery.write")
     schema = pa.schema([("x", pa.int64())])
     with pytest.raises(ValueError, match="Unsupported worker type"):
-        write_mod.writer(schema, "project.dataset.table", worker_type=object)
+        # Deliberately pass an invalid type to exercise runtime validation.
+        write_mod.writer(
+            schema, "project.dataset.table", worker_type=object  # ty: ignore[invalid-argument-type]
+        )
+
+
+@pytest.mark.parametrize("write_method", ["write_table", "write_batch"])
+def test_writer_passes_complete_feather_files_to_workers(monkeypatch, write_method):
+    write_mod = importlib.import_module("pyarrow.bigquery.write")
+    uploaded = []
+
+    def fake_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status):
+        while (path := queue_results.get()) is not None:
+            uploaded.append(write_mod.fa.read_table(path))
+            write_mod.os.remove(path)
+        queue_worker_status.put((write_mod._QUEUE_DONE, None))
+
+    monkeypatch.setattr(write_mod, "_stream_worker", fake_stream_worker)
+    monkeypatch.setattr(write_mod, "_bq_create_table", lambda **kwargs: None)
+    monkeypatch.setattr(write_mod.pa_to_pb, "generate", lambda schema: object())
+
+    table = pa.table({"x": [1, 2, 3]})
+    data = table if write_method == "write_table" else table.to_batches()[0]
+    with write_mod.writer(table.schema, "project.dataset.table", worker_count=1) as w:
+        getattr(w, write_method)(data)
+
+    assert len(uploaded) == 1
+    assert uploaded[0].equals(table)
+    assert not write_mod.os.path.exists(w.temp_dir)
 
 
 def test_writer_uses_bounded_queue(monkeypatch):

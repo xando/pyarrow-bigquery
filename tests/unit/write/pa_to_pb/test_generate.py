@@ -1,8 +1,8 @@
-import pytest
 import pyarrow as pa
-from pyarrow.bigquery.write.pa_to_pb import generate
-
+import pytest
 from google.protobuf.descriptor_pb2 import FieldDescriptorProto
+
+from pyarrow.bigquery.write.pa_to_pb import generate
 
 
 def test_1d():

@@ -1,5 +1,6 @@
-import pyarrow as pa
 import uuid
+
+import pyarrow as pa
 
 from .base import ConcurrencyCompatible
 

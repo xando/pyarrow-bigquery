@@ -1,6 +1,4 @@
 import tenacity
-
-from google.cloud.bigquery_storage_v1 import types
 from google.api_core.exceptions import (
     DeadlineExceeded,
     InternalServerError,
@@ -8,6 +6,7 @@ from google.api_core.exceptions import (
     ServiceUnavailable,
     Unknown,
 )
+from google.cloud.bigquery_storage_v1 import types
 
 from . import pa_to_pb
 

@@ -25,6 +25,8 @@ dev = [
     "ruff",
     "pdbpp",
     "maturin>=1.7,<2.0",
+    "ty>=0.0.91",
+    "types-protobuf>=6,<7",
 ]
 
 [tool.maturin]
@@ -42,3 +44,16 @@ exclude = ["uv.lock"]
 exclude = [".git"]
 line-length = 100
 indent-width = 4
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pyarrow.bigquery"]
+known-third-party = ["pyarrow"]
+
+[tool.ty.environment]
+# Check the local package beneath the installed, regular pyarrow package.
+# Otherwise pyarrow in site-packages shadows src/pyarrow during resolution.
+# Local modules are analyzed as bigquery.*; runtime imports stay pyarrow.bigquery.
+root = ["./src/pyarrow", "."]

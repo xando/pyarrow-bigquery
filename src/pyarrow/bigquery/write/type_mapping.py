@@ -1,9 +1,8 @@
 import collections
 
 import pyarrow as pa
-from google.protobuf.descriptor_pb2 import FieldDescriptorProto
 from google.cloud import bigquery
-
+from google.protobuf.descriptor_pb2 import FieldDescriptorProto
 
 TypeMapping = collections.namedtuple("TypeMapping", ["bq", "pb"])
 

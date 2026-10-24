@@ -11,10 +11,9 @@ import traceback
 import warnings
 from typing import Literal
 
+import pyarrow as pa
 from google.cloud import bigquery, bigquery_storage
 from google.cloud.exceptions import NotFound
-
-import pyarrow as pa
 
 from . import _rust, exchange, some_itertools
 
@@ -121,7 +120,7 @@ def _stream_worker(
     read_streams: list[str],
     table_schema: pa.Schema,
     batch_size: int,
-    queue_results: multiprocessing.Queue,
+    queue_results: multiprocessing.Queue | queue.Queue,
     ipc_exchange,
 ):
     read_client = None
@@ -218,7 +217,7 @@ class reader:
             if ipc_exchange is None:
                 if worker_type == threading.Thread:
                     ipc_exchange = exchange.Memory()
-                elif worker_type == multiprocessing.Process:
+                else:
                     ipc_exchange = exchange.ArrowIpc()
 
             if inspect.isclass(ipc_exchange):
@@ -286,6 +285,9 @@ class reader:
         return self._enter_python()
 
     def _enter_python(self):
+        assert isinstance(
+            self.compression, bigquery_storage.ArrowSerializationOptions.CompressionCodec
+        )
         queue_maxsize = 0
         if type(self.ipc_exchange) is exchange.SharedMemory:
             # Limit in-flight shm segments while the main process drains the queue.
@@ -348,6 +350,7 @@ class reader:
         return self
 
     def _enter_rust(self):
+        assert self.compression is None or isinstance(self.compression, str)
         self._rust_reader = _rust.PyReader(
             self.source,
             self.project,
@@ -398,6 +401,7 @@ class reader:
         if self.actual_worker_count == 0:
             # No streams were created (empty result set); nothing to yield.
             raise StopIteration
+        assert self.ipc_exchange is not None
         while True:
             try:
                 element = self.queue_results.get(timeout=_QUEUE_GET_TIMEOUT)
@@ -428,6 +432,7 @@ class reader:
     # --- rust iteration ---
 
     def _next_rust(self) -> pa.Table:
+        assert self._rust_reader is not None
         while not self._rust_exhausted and self._rust_pending_rows < self.batch_size:
             try:
                 batches = next(self._rust_reader)
@@ -526,7 +531,7 @@ def reader_query(
         job = client.query(query, job_config=job_config)
         job.result()
 
-        source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"  # type: ignore
+        source = f"{job.destination.project}.{job.destination.dataset_id}.{job.destination.table_id}"
 
         return reader(
             source=source,

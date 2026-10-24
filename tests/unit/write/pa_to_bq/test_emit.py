@@ -1,4 +1,5 @@
 import pyarrow as pa
+
 from pyarrow.bigquery.write.pa_to_bq import emit
 
 

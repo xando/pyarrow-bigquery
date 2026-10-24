@@ -1,10 +1,10 @@
-import pytest
-import uuid
 import os
+import uuid
 
 import pyarrow as pa
-import pyarrow.bigquery as bq
+import pytest
 
+import pyarrow.bigquery as bq
 
 PROJECT = os.environ["GCP_PROJECT"]
 

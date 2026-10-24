@@ -1,4 +1,5 @@
 import pyarrow as pa
+
 from pyarrow.bigquery.write.pa_to_pb import amend_schema
 
 
