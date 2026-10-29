@@ -20,9 +20,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _read(api, engine, column_cast=None, empty=False):
+def _read(api, engine, cast_column=None, cast_type=None, empty=False):
     restriction = f"{FILTER} AND FALSE" if empty else FILTER
-    options = dict(engine=engine, column_cast=column_cast, worker_count=1, batch_size=7)
+    options = dict(
+        engine=engine, cast_column=cast_column, cast_type=cast_type, worker_count=1, batch_size=7
+    )
     if "query" in api:
         query = f"SELECT {', '.join(COLUMNS)} FROM `{TABLE}` WHERE {restriction}"
         result = getattr(bq, api)(PROJECT, query, location="US", **options)
@@ -45,28 +47,42 @@ def source_table():
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
 @pytest.mark.parametrize("api", ["read_table", "reader", "read_query", "reader_query"])
-def test_public_table_column_cast(source_table, engine, api):
-    casts = {"word_count": pa.int32(), "corpus_date": pa.int16()}
-    result = _read(api, engine, column_cast=casts).sort_by("word")
+@pytest.mark.parametrize("cast_by", ["cast_column", "cast_type"])
+def test_public_table_cast(source_table, engine, api, cast_by):
+    casts = (
+        {"word_count": pa.int32(), "corpus_date": pa.int16()}
+        if cast_by == "cast_column"
+        else {pa.int64(): pa.int32()}
+    )
+    result = _read(api, engine, **{cast_by: casts}).sort_by("word")
     assert result.num_rows > 7
     assert result.to_pydict() == source_table.to_pydict()
     assert result.schema.field("word_count").type == pa.int32()
-    assert result.schema.field("corpus_date").type == pa.int16()
+    assert result.schema.field("corpus_date").type == (
+        pa.int16() if cast_by == "cast_column" else pa.int32()
+    )
     assert result.schema.field("word").type == source_table.schema.field("word").type
 
-    empty = _read(api, engine, column_cast=casts, empty=True)
+    empty = _read(api, engine, empty=True, **{cast_by: casts})
     assert empty.num_rows == 0
     assert empty.schema == result.schema
 
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
 @pytest.mark.parametrize("api", ["read_query", "reader_query"])
-def test_public_query_list_cast(engine, api):
+@pytest.mark.parametrize("cast_by", ["cast_column", "cast_type"])
+def test_public_query_list_cast(engine, api, cast_by):
     query = f"""
         SELECT word, word_count, [word_count, word_count + 1] AS counts
         FROM `{TABLE}` WHERE {FILTER}
         ORDER BY word LIMIT 5
     """
+    list_type = pa.list_(pa.float64()) if cast_by == "cast_column" else pa.list_(pa.int32())
+    casts = (
+        {"word_count": pa.int32(), "counts": list_type}
+        if cast_by == "cast_column"
+        else {pa.int64(): pa.int32(), pa.list_(pa.int64()): list_type}
+    )
     result = getattr(bq, api)(
         PROJECT,
         query,
@@ -74,7 +90,7 @@ def test_public_query_list_cast(engine, api):
         engine=engine,
         worker_count=1,
         batch_size=2,
-        column_cast={"word_count": pa.int32(), "counts": pa.list_(pa.float64())},
+        **{cast_by: casts},
     )
     if api.startswith("reader"):
         with result as stream:
@@ -84,12 +100,14 @@ def test_public_query_list_cast(engine, api):
             result = pa.concat_tables(chunks)
     assert result.num_rows == 5
     assert result.schema.field("word_count").type == pa.int32()
-    assert result.schema.field("counts").type == pa.list_(pa.float64())
+    assert result.schema.field("counts").type == list_type
     for row in result.to_pylist():
         assert row["counts"] == [float(row["word_count"]), float(row["word_count"] + 1)]
 
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
-def test_public_table_cast_overflow(engine):
+@pytest.mark.parametrize("cast_by", ["cast_column", "cast_type"])
+def test_public_table_cast_overflow(engine, cast_by):
+    casts = {"corpus_date": pa.int8()} if cast_by == "cast_column" else {pa.int64(): pa.int8()}
     with pytest.raises(pa.ArrowInvalid, match="not in range"):
-        _read("read_table", engine, column_cast={"corpus_date": pa.int8()})
+        _read("read_table", engine, **{cast_by: casts})

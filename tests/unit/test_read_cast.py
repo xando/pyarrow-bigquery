@@ -54,7 +54,8 @@ def mock_read(monkeypatch):
 @pytest.mark.parametrize("engine", ["python", "rust"])
 @pytest.mark.parametrize("api", ["reader", "reader_query", "read_table", "read_query"])
 @pytest.mark.parametrize("empty", [False, True])
-def test_column_cast_across_read_apis(mock_read, engine, api, empty):
+@pytest.mark.parametrize("cast_by", ["cast_column", "cast_type"])
+def test_cast_across_read_apis(mock_read, engine, api, empty, cast_by):
     schema = pa.schema(
         [
             pa.field("id", pa.int64(), nullable=False, metadata={b"field": b"metadata"}),
@@ -74,8 +75,12 @@ def test_column_cast_across_read_apis(mock_read, engine, api, empty):
     if empty:
         source = source.slice(0, 0)
     mock_read(source)
-    casts = {"id": pa.int32(), "values": pa.list_(pa.float64())}
-    kwargs = dict(engine=engine, column_cast=casts, batch_size=2, worker_count=1)
+    casts = (
+        {"id": pa.int32(), "values": pa.list_(pa.float64())}
+        if cast_by == "cast_column"
+        else {pa.int64(): pa.int32(), pa.list_(pa.int64()): pa.list_(pa.float64())}
+    )
+    kwargs = dict(engine=engine, batch_size=2, worker_count=1, **{cast_by: casts})
     args = ("p", "SELECT * FROM t") if "query" in api else ("p.d.t",)
     result = getattr(read_mod, api)(*args, **kwargs)
     expected_schema = schema.set(0, schema.field(0).with_type(pa.int32()))
@@ -92,6 +97,7 @@ def test_column_cast_across_read_apis(mock_read, engine, api, empty):
 
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
+@pytest.mark.parametrize("cast_by", ["cast_column", "cast_type"])
 @pytest.mark.parametrize(
     ("values", "target"),
     [
@@ -102,32 +108,89 @@ def test_column_cast_across_read_apis(mock_read, engine, api, empty):
         ([1], pa.list_(pa.float64())),
     ],
 )
-def test_column_cast_raises_on_unsafe_or_unsupported_conversion(mock_read, engine, values, target):
-    mock_read(pa.table({"value": values}))
+def test_cast_raises_on_unsafe_or_unsupported_conversion(
+    mock_read, engine, values, target, cast_by
+):
+    source = pa.table({"value": values})
+    mock_read(source)
+    key = "value" if cast_by == "cast_column" else source.schema.field("value").type
     with pytest.raises((pa.ArrowInvalid, pa.ArrowNotImplementedError)):
-        read_mod.read_table("p.d.t", column_cast={"value": target}, engine=engine, worker_count=1)
+        read_mod.read_table("p.d.t", engine=engine, worker_count=1, **{cast_by: {key: target}})
 
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
-def test_column_cast_requires_column_in_read_schema(mock_read, engine):
+def test_cast_column_requires_column_in_read_schema(mock_read, engine):
     mock_read(pa.table({"selected": [1]}))
     with pytest.raises(KeyError, match="missing.*not in the read schema"):
         with read_mod.reader(
-            "p.d.t", columns=["selected"], column_cast={"missing": pa.int32()}, engine=engine
+            "p.d.t", columns=["selected"], cast_column={"missing": pa.int32()}, engine=engine
         ):
             pass
 
 
-@pytest.mark.parametrize("column_cast", [[("id", pa.int32())], {"id": "int32"}, {1: pa.int32()}])
-def test_column_cast_requires_mapping_to_arrow_types(column_cast):
-    with pytest.raises(TypeError, match="column_cast must"):
-        read_mod.reader("p.d.t", column_cast=column_cast)
+@pytest.mark.parametrize("cast_column", [[("id", pa.int32())], {"id": "int32"}, {1: pa.int32()}])
+def test_cast_column_requires_mapping_to_arrow_types(cast_column):
+    with pytest.raises(TypeError, match="cast_column must"):
+        read_mod.reader("p.d.t", cast_column=cast_column)
+
+
+@pytest.mark.parametrize(
+    "cast_type",
+    [[(pa.int64(), pa.int32())], {"int64": pa.int32()}, {pa.int64(): "int32"}],
+)
+def test_cast_type_requires_mapping_between_arrow_types(cast_type):
+    with pytest.raises(TypeError, match="cast_type must"):
+        read_mod.reader("p.d.t", cast_type=cast_type)
 
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
-@pytest.mark.parametrize("column_cast", [None, {}])
-def test_no_column_cast_preserves_schema_and_values(mock_read, engine, column_cast):
+def test_cast_type_uses_original_top_level_types_with_column_overrides(mock_read, engine):
+    source = pa.table(
+        {
+            "small": pa.array([1, None], type=pa.int32()),
+            "large": pa.array([2**40, None], type=pa.int64()),
+            "other": pa.array([2, None], type=pa.int64()),
+            "lists": pa.array([[1, None], None], type=pa.list_(pa.int64())),
+            "records": pa.array([{"value": 1}, None], type=pa.struct([("value", pa.int64())])),
+            "label": ["a", None],
+        }
+    )
+    mock_read(source)
+    result = read_mod.read_table(
+        "p.d.t",
+        engine=engine,
+        worker_count=1,
+        cast_type={pa.int32(): pa.int64(), pa.int64(): pa.int16(), pa.binary(): pa.string()},
+        cast_column={"large": pa.int64(), "label": pa.large_string()},
+    )
+    assert result.schema.types == [
+        pa.int64(),
+        pa.int64(),
+        pa.int16(),
+        pa.list_(pa.int64()),
+        pa.struct([("value", pa.int64())]),
+        pa.large_string(),
+    ]
+    assert result.to_pydict() == source.to_pydict()
+
+
+@pytest.mark.parametrize("engine", ["python", "rust"])
+def test_cast_type_unmatched_rule_is_ignored(mock_read, engine):
+    source = pa.table({"value": [2**40, None]})
+    mock_read(source)
+    result = read_mod.read_table(
+        "p.d.t", engine=engine, worker_count=1, cast_type={pa.int32(): pa.float32()}
+    )
+    assert result.equals(source)
+
+
+@pytest.mark.parametrize("engine", ["python", "rust"])
+@pytest.mark.parametrize("cast_column", [None, {}])
+@pytest.mark.parametrize("cast_type", [None, {}])
+def test_no_cast_preserves_schema_and_values(mock_read, engine, cast_column, cast_type):
     source = pa.table({"id": [2**40, None], "values": [[1], []]})
     mock_read(source)
-    result = read_mod.read_table("p.d.t", column_cast=column_cast, engine=engine, worker_count=1)
+    result = read_mod.read_table(
+        "p.d.t", cast_column=cast_column, cast_type=cast_type, engine=engine, worker_count=1
+    )
     assert result.equals(source)

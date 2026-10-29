@@ -160,10 +160,13 @@ def _stream_worker(
 class reader:
     """Context manager that streams a BigQuery table as `pa.Table` chunks.
 
-    ``column_cast`` maps top-level column names to PyArrow data types. Casts
-    are safe: unsupported conversions, overflow and precision loss raise an
-    Arrow error. ``schema`` reflects the requested types, including for empty
-    results. Unspecified columns keep their original types.
+    ``cast_column`` maps top-level column names to PyArrow data types.
+    ``cast_type`` maps original top-level column types to target types, with
+    ``cast_column`` taking precedence. Type rules are applied once, without
+    recursively matching nested fields. Casts are safe: unsupported conversions,
+    overflow and precision loss raise an Arrow error. ``schema`` reflects the
+    requested types, including for empty results. Unmatched columns keep their
+    original types.
 
     Two engines are available, selected via `engine=`:
 
@@ -184,7 +187,8 @@ class reader:
         *,
         project: str | None = None,
         columns: list | None = None,
-        column_cast: Mapping[str, pa.DataType] | None = None,
+        cast_column: Mapping[str, pa.DataType] | None = None,
+        cast_type: Mapping[pa.DataType, pa.DataType] | None = None,
         row_restrictions: str | None = None,
         worker_count: int = multiprocessing.cpu_count(),
         worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
@@ -208,12 +212,18 @@ class reader:
         self.source = source
         self.delete_source_on_exit = delete_source_on_exit
         self.columns = columns
-        if column_cast is not None and not isinstance(column_cast, Mapping):
-            raise TypeError("column_cast must be a mapping of column names to PyArrow data types")
-        self.column_cast = dict(column_cast) if column_cast is not None else {}
-        for name, target_type in self.column_cast.items():
+        if cast_column is not None and not isinstance(cast_column, Mapping):
+            raise TypeError("cast_column must be a mapping of column names to PyArrow data types")
+        self.cast_column = dict(cast_column) if cast_column is not None else {}
+        for name, target_type in self.cast_column.items():
             if not isinstance(name, str) or not isinstance(target_type, pa.DataType):
-                raise TypeError("column_cast must map string column names to PyArrow data types")
+                raise TypeError("cast_column must map string column names to PyArrow data types")
+        if cast_type is not None and not isinstance(cast_type, Mapping):
+            raise TypeError("cast_type must be a mapping of PyArrow data types to PyArrow data types")
+        self.cast_type = dict(cast_type) if cast_type is not None else {}
+        for source_type, target_type in self.cast_type.items():
+            if not isinstance(source_type, pa.DataType) or not isinstance(target_type, pa.DataType):
+                raise TypeError("cast_type must map PyArrow data types to PyArrow data types")
         self.row_restrictions = row_restrictions
         self.worker_count = worker_count
         self.worker_type = worker_type
@@ -280,7 +290,8 @@ class reader:
             f"Project: {self.project}, "
             f"Source: {self.source}, "
             f"Columns: {self.columns}, "
-            f"Column cast: {self.column_cast}, "
+            f"Column cast: {self.cast_column}, "
+            f"Type cast: {self.cast_type}, "
             f"Row restrictions: {self.row_restrictions}, "
             f"Worker count: {self.worker_count}, "
             f"Worker type: {self.worker_type}, "
@@ -301,12 +312,16 @@ class reader:
     def _set_schema(self, schema: pa.Schema):
         self._source_schema = schema
         self.schema = schema
-        for name, target_type in self.column_cast.items():
+        for index, field in enumerate(schema):
+            target_type = self.cast_type.get(field.type)
+            if target_type is not None:
+                self.schema = self.schema.set(index, field.with_type(target_type))
+        for name, target_type in self.cast_column.items():
             indices = schema.get_all_field_indices(name)
             if not indices:
-                raise KeyError(f"column_cast column {name!r} is not in the read schema")
+                raise KeyError(f"cast_column column {name!r} is not in the read schema")
             if len(indices) > 1:
-                raise ValueError(f"column_cast column {name!r} is ambiguous in the read schema")
+                raise ValueError(f"cast_column column {name!r} is ambiguous in the read schema")
             index = indices[0]
             self.schema = self.schema.set(index, schema.field(index).with_type(target_type))
 
@@ -407,7 +422,7 @@ class reader:
             table = self._next_rust()
         else:
             table = self._next_python()
-        return table.cast(self.schema, safe=True) if self.column_cast else table
+        return table.cast(self.schema, safe=True) if self.cast_column or self.cast_type else table
 
     # --- python iteration ---
 
@@ -536,7 +551,8 @@ def reader_query(
     query: str,
     *,
     location: str | None = None,
-    column_cast: Mapping[str, pa.DataType] | None = None,
+    cast_column: Mapping[str, pa.DataType] | None = None,
+    cast_type: Mapping[pa.DataType, pa.DataType] | None = None,
     large_results: bool = False,
     large_results_dataset: str = "_temp_pyarrow_bigquery",
     large_results_expiration_ms: int = 24 * 60 * 60 * 1000,  # 24 hours
@@ -570,7 +586,8 @@ def reader_query(
         return reader(
             source=source,
             project=project,
-            column_cast=column_cast,
+            cast_column=cast_column,
+            cast_type=cast_type,
             worker_count=worker_count,
             worker_type=worker_type,
             ipc_exchange=ipc_exchange,
@@ -588,7 +605,8 @@ def read_table(
     *,
     project: str | None = None,
     columns: list | None = None,
-    column_cast: Mapping[str, pa.DataType] | None = None,
+    cast_column: Mapping[str, pa.DataType] | None = None,
+    cast_type: Mapping[pa.DataType, pa.DataType] | None = None,
     row_restrictions: str | None = None,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
@@ -601,7 +619,8 @@ def read_table(
         source=source,
         project=project,
         columns=columns,
-        column_cast=column_cast,
+        cast_column=cast_column,
+        cast_type=cast_type,
         row_restrictions=row_restrictions,
         worker_count=worker_count,
         worker_type=worker_type,
@@ -624,7 +643,8 @@ def read_query(
     query: str,
     *,
     location: str | None = None,
-    column_cast: Mapping[str, pa.DataType] | None = None,
+    cast_column: Mapping[str, pa.DataType] | None = None,
+    cast_type: Mapping[pa.DataType, pa.DataType] | None = None,
     large_results: bool = False,
     large_results_dataset: str = "_temp_pyarrow_bigquery",
     large_results_expiration_ms: int = 24 * 60 * 60 * 1000,  # 24 hours
@@ -639,7 +659,8 @@ def read_query(
         project=project,
         query=query,
         location=location,
-        column_cast=column_cast,
+        cast_column=cast_column,
+        cast_type=cast_type,
         large_results=large_results,
         large_results_dataset=large_results_dataset,
         large_results_expiration_ms=large_results_expiration_ms,

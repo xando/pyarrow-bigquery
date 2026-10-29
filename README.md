@@ -155,20 +155,37 @@ schema, so downstream code can rely on the columns being present.
 
 ### Casting columns on read
 
-Use `column_cast` to convert selected top-level columns to PyArrow types:
+Use `cast_column` to convert selected top-level columns to PyArrow types:
 
 ```python
 table = bq.read_table(
     "my_project.my_dataset.events",
-    column_cast={"field_name": pa.int32(), "other_field": pa.list_(pa.float64())},
+    cast_column={"field_name": pa.int32(), "other_field": pa.list_(pa.float64())},
 )
 ```
 
-The same option works on `reader`, `read_query`, and `reader_query`, with both
-read engines. Casts run locally on each chunk using PyArrow's safe casting.
-Unspecified columns keep their types; column order, nulls, and schema metadata
-are preserved. Unsupported conversions, overflow, and precision loss raise an
-Arrow error. A column absent from the read schema (including one excluded by
+Use `cast_type` to convert every top-level column matching an original PyArrow
+type:
+
+```python
+table = bq.read_table(
+    "my_project.my_dataset.events",
+    cast_type={pa.int64(): pa.int32(), pa.list_(pa.int64()): pa.list_(pa.float64())},
+    cast_column={"large_id": pa.int64()},  # override the type rule for this column
+)
+```
+
+Type rules match the original type of the whole column and apply once. They do
+not recursively match nested fields: `pa.int64(): pa.int32()` leaves lists of
+integers unchanged unless a list type is also mapped. Unmatched rules are
+ignored. When both options match a column, `cast_column` takes precedence;
+conversion goes directly from the original type to the chosen target.
+
+Both options work on `reader`, `read_query`, and `reader_query`, with both read
+engines. Casts run locally on each chunk using PyArrow's safe casting.
+Unmatched columns keep their types; column order, nulls, and schema metadata are
+preserved. Unsupported conversions, overflow, and precision loss raise an Arrow
+error. A named column absent from the read schema (including one excluded by
 `columns`) raises `KeyError`. Nested types such as lists can be converted by
 specifying the target type of the whole column.
 
@@ -389,7 +406,8 @@ Loads a full table into memory (`pa.concat_tables` over internal batches).
 - `source`: `str` — `project.dataset.table`.
 - `project`: `str | None`, *default* `None`.
 - `columns`: `list[str] | None`, *default* `None` — subset of columns; all columns when omitted.
-- `column_cast`: `Mapping[str, pa.DataType] | None`, *default* `None` — safe casts for named top-level columns; see [Casting columns on read](#casting-columns-on-read).
+- `cast_column`: `Mapping[str, pa.DataType] | None`, *default* `None` — safe casts for named top-level columns; see [Casting columns on read](#casting-columns-on-read).
+- `cast_type`: `Mapping[pa.DataType, pa.DataType] | None`, *default* `None` — safe casts for all top-level columns with a matching original type; `cast_column` overrides these rules.
 - `row_restrictions`: `str | None`, *default* `None` — SQL filter pushed down to BigQuery Storage Read.
 - `worker_type`, `worker_count` — parallel fetch backend (Python engine only; `worker_count` still caps stream count under the Rust engine).
 - `ipc_exchange`: exchange instance for worker handoff; default `Memory` (threads) or `ArrowIpc` (processes). Ignored when `engine="rust"`.
