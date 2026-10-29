@@ -12,6 +12,7 @@ An extension library to **write** to and **read** from BigQuery tables as PyArro
   - [Writing](#writing)
 - [Examples](#examples)
   - [Column projection and row filters](#column-projection-and-row-filters)
+  - [Casting columns on read](#casting-columns-on-read)
   - [Query location and large results](#query-location-and-large-results)
   - [Parallel workers and IPC exchange](#parallel-workers-and-ipc-exchange)
   - [Read engines (`engine="python"` vs `"rust"`)](#read-engines-enginepython-vs-rust)
@@ -151,6 +152,28 @@ The same options work on `reader`, `read_query`, and `reader_query`.
 When `row_restrictions` (or the table itself) matches no rows, `read_table` and
 `read_query` return a zero-row `pa.Table` that still carries the BigQuery
 schema, so downstream code can rely on the columns being present.
+
+### Casting columns on read
+
+Use `column_cast` to convert selected top-level columns to PyArrow types:
+
+```python
+table = bq.read_table(
+    "my_project.my_dataset.events",
+    column_cast={"field_name": pa.int32(), "other_field": pa.list_(pa.float64())},
+)
+```
+
+The same option works on `reader`, `read_query`, and `reader_query`, with both
+read engines. Casts run locally on each chunk using PyArrow's safe casting.
+Unspecified columns keep their types; column order, nulls, and schema metadata
+are preserved. Unsupported conversions, overflow, and precision loss raise an
+Arrow error. A column absent from the read schema (including one excluded by
+`columns`) raises `KeyError`. Nested types such as lists can be converted by
+specifying the target type of the whole column.
+
+`reader.schema` reflects the requested types, and empty results retain that
+schema as well.
 
 ### Query location and large results
 
@@ -366,6 +389,7 @@ Loads a full table into memory (`pa.concat_tables` over internal batches).
 - `source`: `str` — `project.dataset.table`.
 - `project`: `str | None`, *default* `None`.
 - `columns`: `list[str] | None`, *default* `None` — subset of columns; all columns when omitted.
+- `column_cast`: `Mapping[str, pa.DataType] | None`, *default* `None` — safe casts for named top-level columns; see [Casting columns on read](#casting-columns-on-read).
 - `row_restrictions`: `str | None`, *default* `None` — SQL filter pushed down to BigQuery Storage Read.
 - `worker_type`, `worker_count` — parallel fetch backend (Python engine only; `worker_count` still caps stream count under the Rust engine).
 - `ipc_exchange`: exchange instance for worker handoff; default `Memory` (threads) or `ArrowIpc` (processes). Ignored when `engine="rust"`.

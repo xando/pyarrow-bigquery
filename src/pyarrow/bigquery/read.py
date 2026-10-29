@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 import warnings
+from collections.abc import Mapping
 from typing import Literal
 
 import pyarrow as pa
@@ -159,6 +160,11 @@ def _stream_worker(
 class reader:
     """Context manager that streams a BigQuery table as `pa.Table` chunks.
 
+    ``column_cast`` maps top-level column names to PyArrow data types. Casts
+    are safe: unsupported conversions, overflow and precision loss raise an
+    Arrow error. ``schema`` reflects the requested types, including for empty
+    results. Unspecified columns keep their original types.
+
     Two engines are available, selected via `engine=`:
 
     - ``engine="python"`` (default): the original implementation. Spawns a
@@ -178,6 +184,7 @@ class reader:
         *,
         project: str | None = None,
         columns: list | None = None,
+        column_cast: Mapping[str, pa.DataType] | None = None,
         row_restrictions: str | None = None,
         worker_count: int = multiprocessing.cpu_count(),
         worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
@@ -201,6 +208,12 @@ class reader:
         self.source = source
         self.delete_source_on_exit = delete_source_on_exit
         self.columns = columns
+        if column_cast is not None and not isinstance(column_cast, Mapping):
+            raise TypeError("column_cast must be a mapping of column names to PyArrow data types")
+        self.column_cast = dict(column_cast) if column_cast is not None else {}
+        for name, target_type in self.column_cast.items():
+            if not isinstance(name, str) or not isinstance(target_type, pa.DataType):
+                raise TypeError("column_cast must map string column names to PyArrow data types")
         self.row_restrictions = row_restrictions
         self.worker_count = worker_count
         self.worker_type = worker_type
@@ -267,6 +280,7 @@ class reader:
             f"Project: {self.project}, "
             f"Source: {self.source}, "
             f"Columns: {self.columns}, "
+            f"Column cast: {self.column_cast}, "
             f"Row restrictions: {self.row_restrictions}, "
             f"Worker count: {self.worker_count}, "
             f"Worker type: {self.worker_type}, "
@@ -284,6 +298,18 @@ class reader:
             return self._enter_rust()
         return self._enter_python()
 
+    def _set_schema(self, schema: pa.Schema):
+        self._source_schema = schema
+        self.schema = schema
+        for name, target_type in self.column_cast.items():
+            indices = schema.get_all_field_indices(name)
+            if not indices:
+                raise KeyError(f"column_cast column {name!r} is not in the read schema")
+            if len(indices) > 1:
+                raise ValueError(f"column_cast column {name!r} is ambiguous in the read schema")
+            index = indices[0]
+            self.schema = self.schema.set(index, schema.field(index).with_type(target_type))
+
     def _enter_python(self):
         assert isinstance(
             self.compression, bigquery_storage.ArrowSerializationOptions.CompressionCodec
@@ -300,7 +326,7 @@ class reader:
         self.workers = []
 
         try:
-            self.streams, self.schema = _bq_read_create_streams(
+            self.streams, schema = _bq_read_create_streams(
                 read_client=self.read_client,
                 parent=self.project,
                 source=self.source,
@@ -312,6 +338,7 @@ class reader:
         finally:
             _close_client_transport(self.read_client)
 
+        self._set_schema(schema)
         self.workers_done = 0
 
         # BigQuery returns zero streams when `row_restrictions` (or the table
@@ -336,7 +363,7 @@ class reader:
                 target=_stream_worker,
                 args=(
                     read_streams,
-                    self.schema,
+                    self._source_schema,
                     self.batch_size,
                     self.queue_results,
                     self.ipc_exchange,
@@ -360,7 +387,11 @@ class reader:
             compression=self.compression,
             batch_size=self.batch_size,
         )
-        self.schema = pa.ipc.read_schema(pa.py_buffer(self._rust_reader.schema_ipc()))
+        try:
+            self._set_schema(pa.ipc.read_schema(pa.py_buffer(self._rust_reader.schema_ipc())))
+        except Exception:
+            self._exit_rust()
+            raise
         self._rust_pending: list[pa.RecordBatch] = []
         self._rust_pending_rows = 0
         self._rust_exhausted = False
@@ -373,8 +404,10 @@ class reader:
 
     def __next__(self):
         if self.engine == "rust":
-            return self._next_rust()
-        return self._next_python()
+            table = self._next_rust()
+        else:
+            table = self._next_python()
+        return table.cast(self.schema, safe=True) if self.column_cast else table
 
     # --- python iteration ---
 
@@ -446,12 +479,12 @@ class reader:
             raise StopIteration
 
         if self._rust_exhausted or self._rust_pending_rows <= self.batch_size:
-            table = pa.Table.from_batches(self._rust_pending, schema=self.schema)
+            table = pa.Table.from_batches(self._rust_pending, schema=self._source_schema)
             self._rust_pending = []
             self._rust_pending_rows = 0
             return table
 
-        combined = pa.Table.from_batches(self._rust_pending, schema=self.schema)
+        combined = pa.Table.from_batches(self._rust_pending, schema=self._source_schema)
         head = combined.slice(0, self.batch_size)
         tail = combined.slice(self.batch_size)
         self._rust_pending = tail.to_batches()
@@ -503,6 +536,7 @@ def reader_query(
     query: str,
     *,
     location: str | None = None,
+    column_cast: Mapping[str, pa.DataType] | None = None,
     large_results: bool = False,
     large_results_dataset: str = "_temp_pyarrow_bigquery",
     large_results_expiration_ms: int = 24 * 60 * 60 * 1000,  # 24 hours
@@ -536,6 +570,7 @@ def reader_query(
         return reader(
             source=source,
             project=project,
+            column_cast=column_cast,
             worker_count=worker_count,
             worker_type=worker_type,
             ipc_exchange=ipc_exchange,
@@ -553,6 +588,7 @@ def read_table(
     *,
     project: str | None = None,
     columns: list | None = None,
+    column_cast: Mapping[str, pa.DataType] | None = None,
     row_restrictions: str | None = None,
     worker_count: int = multiprocessing.cpu_count(),
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
@@ -565,6 +601,7 @@ def read_table(
         source=source,
         project=project,
         columns=columns,
+        column_cast=column_cast,
         row_restrictions=row_restrictions,
         worker_count=worker_count,
         worker_type=worker_type,
@@ -587,6 +624,7 @@ def read_query(
     query: str,
     *,
     location: str | None = None,
+    column_cast: Mapping[str, pa.DataType] | None = None,
     large_results: bool = False,
     large_results_dataset: str = "_temp_pyarrow_bigquery",
     large_results_expiration_ms: int = 24 * 60 * 60 * 1000,  # 24 hours
@@ -601,6 +639,7 @@ def read_query(
         project=project,
         query=query,
         location=location,
+        column_cast=column_cast,
         large_results=large_results,
         large_results_dataset=large_results_dataset,
         large_results_expiration_ms=large_results_expiration_ms,
