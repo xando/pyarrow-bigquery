@@ -334,9 +334,11 @@ Python writer sends protobuf rows and rejects LZ4/Zstandard before creating a
 table. Rust checks the complete request size after Arrow encoding and before
 gRPC compression, including the schema on the first request.
 
-Rust writes use pending streams. A successful context exit waits for all appends,
-finalizes the streams, and commits them together. A write failure or exception in
-the context prevents that commit. Table creation and overwrite happen separately
+Both write engines use pending streams. A successful context exit waits for all
+append acknowledgements, verifies finalized row counts, and commits the streams
+together. Python workers bound their unacknowledged requests to four per stream;
+failed, missing, or mismatched acknowledgements prevent commit. A worker failure
+or an exception escaping the context prevents that commit. Table creation and overwrite happen separately
 and are not rolled back. As with other remote commits, an error receiving the
 commit response can leave its outcome uncertain.
 

@@ -110,17 +110,36 @@ def _bq_write_create_stream(
     )
 
 
-def _bq_storage_close_stream(write_client, stream, parent):
+def _bq_storage_close_stream(write_client, stream, expected_rows):
+    # All append futures must have succeeded before closing the connection.
     stream.append_rows_stream.close()
-    write_client.finalize_write_stream(name=stream.write_stream.name)
+    result = write_client.finalize_write_stream(name=stream.write_stream.name)
+    if result.row_count != expected_rows:
+        raise RuntimeError(
+            f"FinalizeWriteStream returned {result.row_count} rows, expected {expected_rows}"
+        )
+    logger.debug(f"Stream '{stream.write_stream.name}' finalized")
+    return stream.write_stream.name
 
-    batch_commit_write_streams_request = bigquery_storage_v1.types.BatchCommitWriteStreamsRequest()
-    batch_commit_write_streams_request.parent = parent
-    batch_commit_write_streams_request.write_streams = [stream.write_stream.name]
 
-    write_client.batch_commit_write_streams(batch_commit_write_streams_request)
-
-    logger.debug(f"Stream '{stream.write_stream.name}' closed")
+def _bq_storage_commit_streams(parent, stream_names):
+    if not stream_names:
+        return
+    write_client = bigquery_storage_v1.BigQueryWriteClient()
+    try:
+        result = write_client.batch_commit_write_streams(
+            bigquery_storage_v1.types.BatchCommitWriteStreamsRequest(
+                parent=parent, write_streams=stream_names,
+            )
+        )
+        if result.stream_errors:
+            raise RuntimeError(f"BatchCommitWriteStreams failed: {result.stream_errors}")
+        if not bigquery_storage_v1.types.BatchCommitWriteStreamsResponse.pb(result).HasField(
+            "commit_time"
+        ):
+            raise RuntimeError("BatchCommitWriteStreams returned no commit time")
+    finally:
+        _close_client_transport(write_client)
 
 
 def _stream_worker(
@@ -163,13 +182,16 @@ def _stream_worker(
 
             offset += table.num_rows
 
-        queue_worker_status.put((_QUEUE_DONE, None))
+        stream_name = _bq_storage_close_stream(write_client, stream, offset)
+        stream = None
+        queue_worker_status.put((_QUEUE_DONE, stream_name))
     except BaseException as exc:
         queue_worker_status.put(_queue_error(exc))
     finally:
         if stream is not None:
             try:
-                _bq_storage_close_stream(write_client, stream, parent)
+                # On failure, close the RPC but never finalize/commit partial work.
+                stream.append_rows_stream.close()
             except Exception:
                 logger.exception("Failed to close BigQuery write stream")
         _close_client_transport(write_client)
@@ -181,7 +203,8 @@ class writer:
     ``engine="python"`` preserves the Python worker pool. ``engine="rust"``
     passes batches to the bundled extension over the Arrow C Data Interface;
     ``worker_count`` controls native streams and ``worker_type`` is ignored.
-    Rust writes are committed together when the context exits successfully.
+    Both engines commit their pending streams together only after every append
+    and finalization succeeds and the context exits without an exception.
     ``compression="gzip"`` compresses gRPC requests with either engine.
     Rust also supports ``"lz4"`` and ``"zstd"`` for Arrow buffer compression.
     """
@@ -271,6 +294,7 @@ class writer:
             self.queue_results = multiprocessing.Queue(maxsize=queue_maxsize)
             self.queue_worker_status = multiprocessing.Queue()
         self.workers = []
+        self._write_streams = []
 
         for _ in range(self.worker_count):
             worker = self.worker_type(
@@ -348,6 +372,8 @@ class writer:
 
     def _process_worker_status(self, kind: str, payload, workers_done: int):
         if kind == _QUEUE_DONE:
+            if payload is not None:
+                self._write_streams.append(payload)
             return workers_done + 1
 
         if kind == _QUEUE_ERROR:
@@ -389,32 +415,36 @@ class writer:
             logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
             return
 
-        for _ in range(self.worker_count):
-            self.queue_results.put(None)
+        try:
+            for _ in range(self.worker_count):
+                self.queue_results.put(None)
 
-        for w in self.workers:
-            w.join(timeout=_WORKER_JOIN_TIMEOUT)
+            for w in self.workers:
+                w.join(timeout=_WORKER_JOIN_TIMEOUT)
 
-        alive_workers = [w for w in self.workers if w.is_alive()]
-        for worker in alive_workers:
-            terminate = getattr(worker, "terminate", None)
-            if terminate:
-                terminate()
+            alive_workers = [w for w in self.workers if w.is_alive()]
+            for worker in alive_workers:
+                terminate = getattr(worker, "terminate", None)
+                if terminate:
+                    terminate()
 
-        for worker in alive_workers:
-            if getattr(worker, "terminate", None):
-                worker.join(timeout=_WORKER_JOIN_TIMEOUT)
+            for worker in alive_workers:
+                if getattr(worker, "terminate", None):
+                    worker.join(timeout=_WORKER_JOIN_TIMEOUT)
 
-        still_alive = [w for w in self.workers if w.is_alive()]
-        if still_alive:
-            message = f"{len(still_alive)} BigQuery write worker(s) did not stop cleanly"
-            logger.error(message)
+            still_alive = [w for w in self.workers if w.is_alive()]
+            if still_alive:
+                raise RuntimeError(f"{len(still_alive)} BigQuery write worker(s) did not stop cleanly")
+
+            self._drain_worker_status()
             if exc_type is None:
-                raise RuntimeError(message)
-
-        self._drain_worker_status()
-
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+                _bq_storage_commit_streams(self.parent, self._write_streams)
+        except Exception:
+            if exc_type is None:
+                raise
+            logger.exception("Failed to close Python BigQuery writer during exception cleanup")
+        finally:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
         logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
