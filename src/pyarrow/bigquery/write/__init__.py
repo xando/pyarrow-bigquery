@@ -27,6 +27,7 @@ from google.cloud.bigquery_storage_v1.writer import AppendRowsStream
 from google.protobuf import descriptor_pb2
 
 from .. import _rust, some_itertools
+from .._validation import positive_integer
 from . import pa_to_bq, pa_to_pb, upload
 
 logger = logging.getLogger(__name__)
@@ -209,10 +210,7 @@ class writer:
                 f"Unsupported write compression {compression!r} for engine={engine!r}, "
                 f"expected one of {_COMPRESSIONS[engine]}"
             )
-        if engine == "rust" and (
-            not isinstance(worker_count, int) or worker_count < 1
-        ):
-            raise ValueError("worker_count must be a positive integer for engine=\"rust\"")
+        positive_integer(worker_count, "worker_count")
 
         self.project = project
         self.where = where
@@ -445,7 +443,9 @@ def write_table(
     engine: Literal["python", "rust"] = "python",
     compression: Literal["gzip", "lz4", "zstd"] | None = None,
 ):
-    assert table.num_rows > 0, "Table is empty"
+    positive_integer(batch_size, "batch_size")
+    if table.num_rows == 0:
+        raise ValueError("Table is empty")
 
     with writer(
         where=where,

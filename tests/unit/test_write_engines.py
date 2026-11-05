@@ -274,7 +274,7 @@ def test_rust_write_table_wrapper_preserves_chunking_and_options(rust_backend, c
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
 def test_write_table_still_rejects_empty_input(rust_backend, engine):
-    with pytest.raises(AssertionError, match="Table is empty"):
+    with pytest.raises(ValueError, match="Table is empty"):
         rust_backend.module.write_table(
             pa.schema([("x", pa.int64())]).empty_table(),
             "project.dataset.table",
