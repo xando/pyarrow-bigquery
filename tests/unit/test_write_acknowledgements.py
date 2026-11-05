@@ -179,10 +179,14 @@ def test_commit_checks_response_and_always_closes_client(monkeypatch, response, 
 def coordinator(monkeypatch):
     commits = []
 
-    def worker(parent, schema, work, status, compression=None):
-        while work.get() is not None:
-            pass
-        status.put((write_mod._QUEUE_DONE, "stream"))
+    def worker(parent, schema, work, status, compression=None, stop_event=None):
+        while not stop_event.is_set():
+            try:
+                if work.get(timeout=0.01) is None:
+                    status.put((write_mod._QUEUE_DONE, "stream"))
+                    return
+            except write_mod.queue.Empty:
+                pass
 
     monkeypatch.setattr(write_mod, "_stream_worker", worker)
     monkeypatch.setattr(write_mod, "_bq_storage_commit_streams",
@@ -225,10 +229,14 @@ def test_failed_worker_prevents_commit_of_successful_peers(coordinator, monkeypa
         (write_mod._QUEUE_ERROR, ("RuntimeError", "peer failed", "traceback")),
     ])
 
-    def worker(parent, schema, work, status, compression=None):
-        while work.get() is not None:
-            pass
-        status.put(next(statuses))
+    def worker(parent, schema, work, status, compression=None, stop_event=None):
+        while not stop_event.is_set():
+            try:
+                if work.get(timeout=0.01) is None:
+                    status.put(next(statuses))
+                    return
+            except write_mod.queue.Empty:
+                pass
 
     monkeypatch.setattr(write_mod, "_stream_worker", worker)
     with pytest.raises(RuntimeError, match="peer failed"):

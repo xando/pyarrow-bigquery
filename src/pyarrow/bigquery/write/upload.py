@@ -1,4 +1,7 @@
+import time
 from collections import deque
+from concurrent.futures import CancelledError
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 import tenacity
 from google.api_core.exceptions import (
@@ -43,8 +46,20 @@ def _send(stream, serialized_rows, offset):
     return stream.append_rows_stream.send(request)
 
 
-def _acknowledge(future, expected_offset):
-    response = future.result(timeout=_APPEND_TIMEOUT)
+def _acknowledge(future, expected_offset, stop_event=None):
+    if stop_event is None:
+        response = future.result(timeout=_APPEND_TIMEOUT)
+    else:
+        deadline = time.monotonic() + _APPEND_TIMEOUT
+        while True:
+            if stop_event.is_set():
+                raise CancelledError("BigQuery write cancelled")
+            try:
+                response = future.result(timeout=max(0, min(0.25, deadline - time.monotonic())))
+                break
+            except FutureTimeoutError:
+                if time.monotonic() >= deadline:
+                    raise
     if response.row_errors:
         raise RuntimeError(f"AppendRows row errors: {response.row_errors}")
     protobuf = types.AppendRowsResponse.pb(response)
@@ -62,14 +77,16 @@ def _acknowledge(future, expected_offset):
         )
 
 
-def upload_data(stream, pa_table, protobuf_definition, offset):
+def upload_data(stream, pa_table, protobuf_definition, offset, stop_event=None):
     pending = deque()
     local_offset = 0
     for serialized_rows in pa_to_pb.serialize(pa_table, protobuf_definition):
+        if stop_event is not None and stop_event.is_set():
+            raise CancelledError("BigQuery write cancelled")
         if len(pending) == _MAX_IN_FLIGHT_REQUESTS:
-            _acknowledge(*pending.popleft())
+            _acknowledge(*pending.popleft(), stop_event=stop_event)
         request_offset = offset + local_offset
         pending.append((_send(stream, serialized_rows, request_offset), request_offset))
         local_offset += len(serialized_rows)
     while pending:
-        _acknowledge(*pending.popleft())
+        _acknowledge(*pending.popleft(), stop_event=stop_event)

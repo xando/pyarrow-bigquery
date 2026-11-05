@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import warnings
+from concurrent.futures import CancelledError
 from typing import Literal
 
 import grpc
@@ -148,6 +149,7 @@ def _stream_worker(
     queue_results,
     queue_worker_status,
     compression: str | None = None,
+    stop_event=None,
 ):
     write_client = None
     stream = None
@@ -170,21 +172,36 @@ def _stream_worker(
         offset = 0
 
         while True:
-            element = queue_results.get()
+            if stop_event is not None and stop_event.is_set():
+                return
+            try:
+                element = queue_results.get(timeout=_QUEUE_GET_TIMEOUT)
+            except queue.Empty:
+                continue
             if element is None:
                 break
+            if stop_event is not None and stop_event.is_set():
+                return
 
             table = fa.read_table(element)
 
-            upload.upload_data(stream, table, schema_protobuf, offset)
+            if stop_event is None:
+                upload.upload_data(stream, table, schema_protobuf, offset)
+            else:
+                upload.upload_data(stream, table, schema_protobuf, offset, stop_event=stop_event)
 
             os.remove(element)
 
             offset += table.num_rows
 
+        if stop_event is not None and stop_event.is_set():
+            return
         stream_name = _bq_storage_close_stream(write_client, stream, offset)
         stream = None
         queue_worker_status.put((_QUEUE_DONE, stream_name))
+    except CancelledError as exc:
+        if stop_event is None or not stop_event.is_set():
+            queue_worker_status.put(_queue_error(exc))
     except BaseException as exc:
         queue_worker_status.put(_queue_error(exc))
     finally:
@@ -243,6 +260,7 @@ class writer:
         self.engine = engine
         self.compression = compression
         self._rust_writer = None
+        self._python_open = False
 
         self.table_create = table_create
         self.table_expire = table_expire
@@ -274,44 +292,55 @@ class writer:
         if self.engine == "rust":
             return self._enter_rust()
 
-        self.temp_dir = tempfile.mkdtemp()
-        self.schema_protobuf = pa_to_pb.generate(self.schema)
+        if self._python_open:
+            raise RuntimeError("BigQuery writer is already open")
+        self.workers = []
+        self._write_streams = []
+        self._workers_done = 0
+        self._failure = None
+        self._closing = False
         queue_maxsize = max(4, self.worker_count * 2)
-
-        if self.table_create:
-            _bq_create_table(
-                project=self.project,
-                location=self.where,
-                schema=self.schema,
-                expire=self.table_expire,
-                overwrite=self.table_overwrite,
-            )
-
         if self.worker_type == threading.Thread:
             self.queue_results = queue.Queue(maxsize=queue_maxsize)
             self.queue_worker_status = queue.Queue()
+            self._stop_event = threading.Event()
         else:
             self.queue_results = multiprocessing.Queue(maxsize=queue_maxsize)
             self.queue_worker_status = multiprocessing.Queue()
-        self.workers = []
-        self._write_streams = []
+            self._stop_event = multiprocessing.Event()
+        self.temp_dir = tempfile.mkdtemp()
+        try:
+            self.schema_protobuf = pa_to_pb.generate(self.schema)
+            if self.table_create:
+                _bq_create_table(
+                    project=self.project,
+                    location=self.where,
+                    schema=self.schema,
+                    expire=self.table_expire,
+                    overwrite=self.table_overwrite,
+                )
 
-        for _ in range(self.worker_count):
-            worker = self.worker_type(
-                target=_stream_worker,
-                args=(
-                    self.parent,
-                    self.schema_protobuf,
-                    self.queue_results,
-                    self.queue_worker_status,
-                    self.compression,
-                ),
-            )
-            if self.worker_type == threading.Thread:
-                worker.daemon = True
-            worker.start()
-            self.workers.append(worker)
+            for _ in range(self.worker_count):
+                worker = self.worker_type(
+                    target=_stream_worker,
+                    args=(
+                        self.parent,
+                        self.schema_protobuf,
+                        self.queue_results,
+                        self.queue_worker_status,
+                        self.compression,
+                        self._stop_event,
+                    ),
+                )
+                if self.worker_type == threading.Thread:
+                    worker.daemon = True
+                worker.start()
+                self.workers.append(worker)
+        except BaseException:
+            self._cleanup_python()
+            raise
 
+        self._python_open = True
         return self
 
     def _enter_rust(self):
@@ -349,6 +378,8 @@ class writer:
         return self._rust_writer
 
     def write_table(self, table):
+        if self.engine == "python":
+            self._check_python_write()
         if self.engine == "rust":
             rust_writer = self._open_rust_writer()
             for batch in table.to_batches():
@@ -357,18 +388,30 @@ class writer:
 
         fd, element = tempfile.mkstemp(dir=self.temp_dir)
         os.close(fd)
-        fa.write_feather(table, element)
-        self.queue_results.put(element)
+        try:
+            fa.write_feather(table, element)
+            self._put_work(element)
+        except BaseException as exc:
+            self._record_failure(exc)
+            os.remove(element)
+            raise
 
     def write_batch(self, batch):
+        if self.engine == "python":
+            self._check_python_write()
         if self.engine == "rust":
             self._open_rust_writer().write_batch(batch)
             return
 
         fd, element = tempfile.mkstemp(dir=self.temp_dir)
         os.close(fd)
-        fa.write_feather(pa.Table.from_batches([batch]), element)
-        self.queue_results.put(element)
+        try:
+            fa.write_feather(pa.Table.from_batches([batch]), element)
+            self._put_work(element)
+        except BaseException as exc:
+            self._record_failure(exc)
+            os.remove(element)
+            raise
 
     def _process_worker_status(self, kind: str, payload, workers_done: int):
         if kind == _QUEUE_DONE:
@@ -385,29 +428,101 @@ class writer:
 
         raise RuntimeError(f"Unexpected BigQuery write worker message: {(kind, payload)!r}")
 
-    def _raise_if_workers_failed(self, workers_done: int):
-        for idx, worker in enumerate(self.workers):
-            exitcode = getattr(worker, "exitcode", None)
-            if exitcode not in (None, 0):
-                raise RuntimeError(f"BigQuery write worker {idx} exited with code {exitcode}")
+    def _record_failure(self, error):
+        if self._failure is None:
+            self._failure = error
+        self._stop_event.set()
 
-        if workers_done < self.worker_count and self.workers:
-            if all(not worker.is_alive() for worker in self.workers):
-                raise RuntimeError(
-                    "BigQuery write workers exited before signaling completion"
-                )
-
-    def _drain_worker_status(self):
-        workers_done = 0
-        while workers_done < self.worker_count:
+    def _collect_worker_status(self, wait=False):
+        while True:
             try:
-                element = self.queue_worker_status.get(timeout=_QUEUE_GET_TIMEOUT)
+                message = self.queue_worker_status.get(timeout=_QUEUE_GET_TIMEOUT if wait else 0)
             except queue.Empty:
-                self._raise_if_workers_failed(workers_done)
+                return
+            wait = False
+            self._workers_done = self._process_worker_status(*message, self._workers_done)
+            if self._workers_done > self.worker_count:
+                raise RuntimeError("BigQuery write workers sent duplicate completion messages")
+
+    def _check_worker_status(self, wait=False):
+        if self._failure is not None:
+            raise self._failure
+        try:
+            self._collect_worker_status(wait=wait)
+            for idx, worker in enumerate(self.workers):
+                exitcode = getattr(worker, "exitcode", None)
+                if exitcode not in (None, 0):
+                    raise RuntimeError(f"BigQuery write worker {idx} exited with code {exitcode}")
+            if self.workers and all(not worker.is_alive() for worker in self.workers):
+                # A worker can publish its last status between our first poll
+                # and the liveness check. Recheck before declaring it missing.
+                self._collect_worker_status()
+                if self._workers_done < self.worker_count:
+                    raise RuntimeError("BigQuery write workers exited before signaling completion")
+            if not self._closing and self._workers_done:
+                raise RuntimeError("BigQuery write workers stopped before input was closed")
+        except BaseException as exc:
+            self._record_failure(exc)
+            raise
+
+    def _check_python_write(self):
+        if not self._python_open or self._closing:
+            raise RuntimeError("BigQuery writer is not open; use it inside a with block")
+        self._check_worker_status()
+
+    def _put_work(self, element):
+        while True:
+            self._check_worker_status()
+            if element is None and self._workers_done == self.worker_count:
+                return
+            try:
+                self.queue_results.put(element, timeout=_QUEUE_GET_TIMEOUT)
+                return
+            except queue.Full:
                 continue
 
-            kind, payload = element
-            workers_done = self._process_worker_status(kind, payload, workers_done)
+    def _drain_worker_status(self):
+        while self._workers_done < self.worker_count:
+            self._check_worker_status(wait=True)
+
+    def _join_python_workers(self, abort=False):
+        if not abort:
+            # Completion has already been acknowledged by every worker. Allow
+            # client and process teardown to finish without killing healthy work.
+            for worker in self.workers:
+                worker.join()
+            return
+        deadline = time.monotonic() + _WORKER_JOIN_TIMEOUT
+        for worker in self.workers:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        alive_workers = [worker for worker in self.workers if worker.is_alive()]
+        for worker in alive_workers:
+            terminate = getattr(worker, "terminate", None)
+            if terminate:
+                terminate()
+        for worker in alive_workers:
+            if getattr(worker, "terminate", None):
+                worker.join(timeout=_WORKER_JOIN_TIMEOUT)
+        still_alive = [worker for worker in self.workers if worker.is_alive()]
+        if still_alive:
+            raise RuntimeError(f"{len(still_alive)} BigQuery write worker(s) did not stop cleanly")
+
+    def _cleanup_python(self):
+        self._stop_event.set()
+        try:
+            self._join_python_workers(abort=True)
+        except Exception as exc:
+            self._record_failure(exc)
+            logger.exception("Failed to stop Python BigQuery workers during cleanup")
+        finally:
+            self._python_open = False
+            if self.worker_type == multiprocessing.Process:
+                for worker_queue in (self.queue_results, self.queue_worker_status):
+                    # Aborted workers may leave queued paths unread. Do not
+                    # wait forever for a producer feeder to flush to no reader.
+                    worker_queue.cancel_join_thread()
+                    worker_queue.close()
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def __exit__(self, exc_type, *_):
         if self.engine == "rust":
@@ -415,37 +530,26 @@ class writer:
             logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
             return
 
+        self._closing = True
         try:
-            for _ in range(self.worker_count):
-                self.queue_results.put(None)
-
-            for w in self.workers:
-                w.join(timeout=_WORKER_JOIN_TIMEOUT)
-
-            alive_workers = [w for w in self.workers if w.is_alive()]
-            for worker in alive_workers:
-                terminate = getattr(worker, "terminate", None)
-                if terminate:
-                    terminate()
-
-            for worker in alive_workers:
-                if getattr(worker, "terminate", None):
-                    worker.join(timeout=_WORKER_JOIN_TIMEOUT)
-
-            still_alive = [w for w in self.workers if w.is_alive()]
-            if still_alive:
-                raise RuntimeError(f"{len(still_alive)} BigQuery write worker(s) did not stop cleanly")
-
-            self._drain_worker_status()
-            if exc_type is None:
+            if exc_type is None and self._failure is None:
+                for _ in range(self.worker_count):
+                    self._put_work(None)
+                # Wait for real upload/finalization completion before applying
+                # the shutdown timeout. Slow healthy uploads are not killed.
+                self._drain_worker_status()
+                self._join_python_workers()
+                self._check_worker_status()
                 _bq_storage_commit_streams(self.parent, self._write_streams)
-        except Exception:
-            if exc_type is None:
-                raise
-            logger.exception("Failed to close Python BigQuery writer during exception cleanup")
+        except BaseException as exc:
+            self._record_failure(exc)
         finally:
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            self._cleanup_python()
 
+        if self._failure is not None:
+            if exc_type is None:
+                raise self._failure
+            logger.error("Python BigQuery writer aborted: %s", self._failure)
         logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
     def _exit_rust(self, exc_type):
