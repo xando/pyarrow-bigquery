@@ -17,6 +17,7 @@ from google.cloud import bigquery, bigquery_storage
 from google.cloud.exceptions import NotFound
 
 from . import _rust, exchange, some_itertools
+from ._validation import positive_integer
 
 PYARROW_COMPRESSIONS = {
     None: bigquery_storage.ArrowSerializationOptions.CompressionCodec.COMPRESSION_UNSPECIFIED,
@@ -198,6 +199,8 @@ class reader:
         delete_source_on_exit: bool = False,
         engine: Literal["python", "rust"] = "python",
     ):
+        positive_integer(worker_count, "worker_count")
+        positive_integer(batch_size, "batch_size")
         if engine not in _ENGINES:
             raise ValueError(
                 f"Unsupported engine {engine!r}, expected one of {_ENGINES}"
@@ -231,10 +234,11 @@ class reader:
         self.engine = engine
 
         if engine == "python":
-            assert compression in PYARROW_COMPRESSIONS, (
-                f"Compression {compression} not supported, "
-                f"available: {list(PYARROW_COMPRESSIONS.keys())}"
-            )
+            if compression not in _RUST_COMPRESSION_CHOICES:
+                raise ValueError(
+                    f"Compression {compression} not supported, "
+                    f"available: {list(PYARROW_COMPRESSIONS.keys())}"
+                )
             self.compression = PYARROW_COMPRESSIONS[compression]
 
             if ipc_exchange is None:
@@ -264,7 +268,7 @@ class reader:
             self.ipc_exchange = ipc_exchange
         else:  # engine == "rust"
             if compression not in _RUST_COMPRESSION_CHOICES:
-                raise AssertionError(
+                raise ValueError(
                     f"Compression {compression} not supported, "
                     f"available: {list(_RUST_COMPRESSION_CHOICES)}"
                 )
@@ -563,6 +567,8 @@ def reader_query(
     compression: str | None = None,
     engine: Literal["python", "rust"] = "python",
 ):
+    positive_integer(worker_count, "worker_count")
+    positive_integer(batch_size, "batch_size")
     client = bigquery.Client(project=project, location=location)
     try:
         if large_results:
