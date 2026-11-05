@@ -18,4 +18,4 @@ class Memory(ConcurrencyCompatible):
         return key
 
     def load(self, key: str) -> pa.Table:
-        return self.memory[key]
+        return self.memory.pop(key)

@@ -10,3 +10,7 @@ class ConcurrencyCompatible(typing.Protocol):
     def store(self, table: pa.Table) -> str: ...
 
     def load(self, key: str) -> pa.Table: ...
+
+    def discard(self, key: str) -> None:
+        """Release an unread result. Exchanges may override to avoid decoding."""
+        self.load(key)

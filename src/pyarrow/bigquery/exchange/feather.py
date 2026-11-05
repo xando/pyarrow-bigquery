@@ -30,6 +30,9 @@ class Feather(ConcurrencyCompatible):
 
         return file_name
 
+    def discard(self, key: str) -> None:
+        _unlink(key)
+
     def load(self, key: str) -> pa.Table:
         table = fa.read_table(key, memory_map=True)
         weakref.finalize(table, _unlink, key)

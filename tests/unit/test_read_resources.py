@@ -68,7 +68,9 @@ def test_reader_deletes_source_on_exit_python(monkeypatch):
         lambda **kwargs: (["stream-1"], pa.schema([("x", pa.int64())])),
     )
 
-    def fake_stream_worker(read_streams, table_schema, batch_size, queue_results, ipc_exchange):
+    def fake_stream_worker(
+        read_streams, table_schema, batch_size, queue_results, ipc_exchange, stop_event=None,
+    ):
         queue_results.put((read_mod._QUEUE_DONE, None))
 
     monkeypatch.setattr(read_mod, "_stream_worker", fake_stream_worker)
