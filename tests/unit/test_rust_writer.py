@@ -18,15 +18,23 @@ def no_cloud_credentials(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("commit", [True, False])
-def test_native_constructor_and_idempotent_close_are_offline(commit):
+@pytest.mark.parametrize("compression", [None, "gzip", "lz4", "zstd"])
+def test_native_constructor_and_idempotent_close_are_offline(commit, compression):
     writer = _rust.PyWriter(
         parent=PARENT,
         schema=pa.schema([("x", pa.int64())]),
         worker_count=2,
+        compression=compression,
     )
     assert writer.close(commit=commit) is None
     assert writer.close(commit=commit) is None
     assert writer.close(commit=not commit) is None
+
+
+@pytest.mark.parametrize("compression", ["snappy", "brotli", "GZIP", ""])
+def test_native_rejects_unknown_compression_offline(compression):
+    with pytest.raises(ValueError, match="Unsupported write compression"):
+        _rust.PyWriter(PARENT, pa.schema([("x", pa.int64())]), compression=compression)
 
 
 def test_native_empty_batch_uses_arrow_interface_without_opening_streams():

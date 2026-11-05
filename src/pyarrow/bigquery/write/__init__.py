@@ -14,11 +14,15 @@ import traceback
 import warnings
 from typing import Literal
 
+import grpc
 import pyarrow as pa
 import pyarrow.feather as fa
 from google.api_core import retry
 from google.api_core.exceptions import NotFound, Unknown
 from google.cloud import bigquery, bigquery_storage_v1
+from google.cloud.bigquery_storage_v1.services.big_query_write.transports.grpc import (
+    BigQueryWriteGrpcTransport,
+)
 from google.cloud.bigquery_storage_v1.writer import AppendRowsStream
 from google.protobuf import descriptor_pb2
 
@@ -28,6 +32,10 @@ from . import pa_to_bq, pa_to_pb, upload
 logger = logging.getLogger(__name__)
 
 _ENGINES = ("python", "rust")
+_COMPRESSIONS = {
+    "python": (None, "gzip"),
+    "rust": (None, "gzip", "lz4", "zstd"),
+}
 
 _QUEUE_DONE = "done"
 _QUEUE_ERROR = "error"
@@ -120,11 +128,24 @@ def _stream_worker(
     schema_protobuf,
     queue_results,
     queue_worker_status,
+    compression: str | None = None,
 ):
     write_client = None
     stream = None
     try:
-        write_client = bigquery_storage_v1.BigQueryWriteClient()
+        if compression == "gzip":
+            # Pass a channel instance for compatibility with Storage client 2.18.
+            channel = BigQueryWriteGrpcTransport.create_channel(
+                compression=grpc.Compression.Gzip,
+                options=[
+                    ("grpc.max_send_message_length", -1),
+                    ("grpc.max_receive_message_length", -1),
+                ],
+            )
+            transport = BigQueryWriteGrpcTransport(channel=channel)
+            write_client = bigquery_storage_v1.BigQueryWriteClient(transport=transport)
+        else:
+            write_client = bigquery_storage_v1.BigQueryWriteClient()
         stream = _bq_write_create_stream(write_client, parent, schema_protobuf)
 
         offset = 0
@@ -161,6 +182,8 @@ class writer:
     passes batches to the bundled extension over the Arrow C Data Interface;
     ``worker_count`` controls native streams and ``worker_type`` is ignored.
     Rust writes are committed together when the context exits successfully.
+    ``compression="gzip"`` compresses gRPC requests with either engine.
+    Rust also supports ``"lz4"`` and ``"zstd"`` for Arrow buffer compression.
     """
 
     def __init__(
@@ -175,10 +198,16 @@ class writer:
         worker_count: int = multiprocessing.cpu_count(),
         worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
         engine: Literal["python", "rust"] = "python",
+        compression: Literal["gzip", "lz4", "zstd"] | None = None,
     ):
         if engine not in _ENGINES:
             raise ValueError(
                 f"Unsupported engine {engine!r}, expected one of {_ENGINES}"
+            )
+        if compression not in _COMPRESSIONS[engine]:
+            raise ValueError(
+                f"Unsupported write compression {compression!r} for engine={engine!r}, "
+                f"expected one of {_COMPRESSIONS[engine]}"
             )
         if engine == "rust" and (
             not isinstance(worker_count, int) or worker_count < 1
@@ -189,6 +218,7 @@ class writer:
         self.where = where
         self.schema = schema
         self.engine = engine
+        self.compression = compression
         self._rust_writer = None
 
         self.table_create = table_create
@@ -250,6 +280,7 @@ class writer:
                     self.schema_protobuf,
                     self.queue_results,
                     self.queue_worker_status,
+                    self.compression,
                 ),
             )
             if self.worker_type == threading.Thread:
@@ -268,6 +299,7 @@ class writer:
             parent=self.parent,
             schema=self.schema,
             worker_count=self.worker_count,
+            compression=self.compression,
         )
         try:
             if self.table_create:
@@ -411,6 +443,7 @@ def write_table(
     worker_type: type[threading.Thread] | type[multiprocessing.Process] = threading.Thread,
     batch_size: int = 10,
     engine: Literal["python", "rust"] = "python",
+    compression: Literal["gzip", "lz4", "zstd"] | None = None,
 ):
     assert table.num_rows > 0, "Table is empty"
 
@@ -424,6 +457,7 @@ def write_table(
         worker_count=worker_count,
         worker_type=worker_type,
         engine=engine,
+        compression=compression,
     ) as w:
         for table_chunk in some_itertools.to_chunks(table, batch_size):
             w.write_table(table_chunk)

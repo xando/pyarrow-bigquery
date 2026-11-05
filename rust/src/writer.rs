@@ -4,6 +4,7 @@
 // methods, so this lint must be allowed at the containing module level.
 #![allow(clippy::useless_conversion)]
 
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -11,14 +12,17 @@ use std::sync::{
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::writer::{write_message, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+use arrow::ipc::CompressionType;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
+use futures::{Stream, StreamExt};
 use prost::Message;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -40,7 +44,47 @@ const SCOPE: &[&str] = &["https://www.googleapis.com/auth/bigquery"];
 // The Storage Write protocol requires each complete protobuf request to be <10 MB.
 const MAX_REQUEST_BYTES: usize = 10_000_000;
 const WORKER_QUEUE_CAPACITY: usize = 2;
+// Bound both unacknowledged appends and their serialized buffers per stream.
+const MAX_IN_FLIGHT_REQUESTS: usize = 4;
 const MAX_CREATE_RETRIES: usize = 5;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WriteCompression {
+    #[default]
+    Uncompressed,
+    Gzip,
+    Lz4,
+    Zstd,
+}
+
+impl WriteCompression {
+    fn transport(self) -> Option<CompressionEncoding> {
+        match self {
+            Self::Gzip => Some(CompressionEncoding::Gzip),
+            _ => None,
+        }
+    }
+
+    fn arrow(self) -> Option<CompressionType> {
+        match self {
+            Self::Lz4 => Some(CompressionType::LZ4_FRAME),
+            Self::Zstd => Some(CompressionType::ZSTD),
+            _ => None,
+        }
+    }
+}
+
+fn compression_from_str(compression: Option<&str>) -> Result<WriteCompression, String> {
+    match compression {
+        None => Ok(WriteCompression::Uncompressed),
+        Some("gzip") => Ok(WriteCompression::Gzip),
+        Some("lz4") => Ok(WriteCompression::Lz4),
+        Some("zstd") => Ok(WriteCompression::Zstd),
+        Some(value) => Err(format!(
+            "Unsupported write compression {value:?}, expected None, 'gzip', 'lz4' or 'zstd'"
+        )),
+    }
+}
 
 #[derive(Clone)]
 struct AuthInterceptor {
@@ -59,7 +103,7 @@ impl tonic::service::Interceptor for AuthInterceptor {
 
 type Client = BigQueryWriteClient<InterceptedService<Channel, AuthInterceptor>>;
 
-async fn build_client() -> Result<Client, String> {
+async fn build_client(compression: Option<CompressionEncoding>) -> Result<Client, String> {
     let provider = gcp_auth::provider()
         .await
         .map_err(|e| format!("gcp auth: {e}"))?;
@@ -73,14 +117,18 @@ async fn build_client() -> Result<Client, String> {
         .connect()
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    Ok(BigQueryWriteClient::with_interceptor(
+    let client = BigQueryWriteClient::with_interceptor(
         channel,
         AuthInterceptor {
             token: Arc::from(token.as_str()),
         },
     )
     .max_encoding_message_size(MAX_REQUEST_BYTES)
-    .max_decoding_message_size(MAX_REQUEST_BYTES))
+    .max_decoding_message_size(MAX_REQUEST_BYTES);
+    Ok(match compression {
+        Some(encoding) => client.send_compressed(encoding),
+        None => client,
+    })
 }
 
 fn routed_request<T>(body: T, key: &str, value: &str) -> Result<Request<T>, String> {
@@ -126,8 +174,10 @@ fn schema_ipc(schema: &Schema) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn batch_ipc(batch: &RecordBatch) -> Result<Vec<u8>, String> {
-    let options = IpcWriteOptions::default();
+fn batch_ipc(batch: &RecordBatch, compression: WriteCompression) -> Result<Vec<u8>, String> {
+    let options = IpcWriteOptions::default()
+        .try_with_compression(compression.arrow())
+        .map_err(|e| format!("Arrow compression: {e}"))?;
     let (dictionaries, encoded) = IpcDataGenerator::default()
         .encoded_batch(batch, &mut DictionaryTracker::new(false), &options)
         .map_err(|e| format!("Arrow batch: {e}"))?;
@@ -144,6 +194,7 @@ fn append_request(
     offset: i64,
     schema: Option<&[u8]>,
     batch: &RecordBatch,
+    compression: WriteCompression,
 ) -> Result<AppendRowsRequest, String> {
     Ok(AppendRowsRequest {
         write_stream: stream.to_owned(),
@@ -153,7 +204,7 @@ fn append_request(
                 serialized_schema: bytes.to_vec(),
             }),
             rows: Some(ArrowRecordBatch {
-                serialized_record_batch: batch_ipc(batch)?,
+                serialized_record_batch: batch_ipc(batch, compression)?,
                 ..Default::default()
             }),
         })),
@@ -169,13 +220,14 @@ fn fitting_request(
     schema: Option<&[u8]>,
     batch: &RecordBatch,
     limit: usize,
+    compression: WriteCompression,
 ) -> Result<(AppendRowsRequest, usize), String> {
     let mut rows = batch.num_rows();
     if rows == 0 {
         return Err("cannot append an empty record batch".into());
     }
     loop {
-        let request = append_request(stream, offset, schema, &batch.slice(0, rows))?;
+        let request = append_request(stream, offset, schema, &batch.slice(0, rows), compression)?;
         if request.encoded_len() < limit {
             return Ok((request, rows));
         }
@@ -219,14 +271,19 @@ fn check_commit(response: BatchCommitWriteStreamsResponse) -> Result<(), String>
     Ok(())
 }
 
-struct AppendConnection {
+struct AppendConnection<S = tonic::Streaming<AppendRowsResponse>> {
     requests: mpsc::Sender<AppendRowsRequest>,
-    responses: tonic::Streaming<AppendRowsResponse>,
+    responses: S,
+    pending: VecDeque<i64>,
+    error: Option<String>,
 }
 
 impl AppendConnection {
     async fn open(client: &mut Client, first: AppendRowsRequest) -> Result<Self, String> {
         let stream_name = first.write_stream.clone();
+        let offset = first
+            .offset
+            .ok_or("AppendRows request is missing its offset")?;
         let (tx, rx) = mpsc::channel(1);
         // Queue the first request before opening: the server can wait for its
         // stream name and schema before sending the response headers.
@@ -244,40 +301,88 @@ impl AppendConnection {
         Ok(Self {
             requests: tx,
             responses,
+            pending: VecDeque::from([offset]),
+            error: None,
         })
-    }
-
-    async fn send(&mut self, request: AppendRowsRequest) -> Result<(), String> {
-        self.requests
-            .send(request)
-            .await
-            .map_err(|_| "AppendRows request channel closed".to_string())
-    }
-
-    async fn acknowledge(&mut self, offset: i64) -> Result<(), String> {
-        let response = self
-            .responses
-            .message()
-            .await
-            .map_err(|e| format!("AppendRows response: {e}"))?
-            .ok_or_else(|| "AppendRows closed before acknowledging a request".to_string())?;
-        check_append(response, offset)
-    }
-
-    async fn finish(mut self) -> Result<(), String> {
-        drop(self.requests);
-        // Every sent request has already been acknowledged. Half-close and
-        // consume the terminal status before finalizing the pending stream.
-        match self.responses.message().await {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err("AppendRows returned an unexpected extra response".into()),
-            Err(e) => Err(format!("AppendRows completion: {e}")),
-        }
     }
 }
 
-async fn create_stream(parent: &str) -> Result<(Client, String), String> {
-    let mut client = build_client().await?;
+impl<S> AppendConnection<S>
+where
+    S: Stream<Item = Result<AppendRowsResponse, tonic::Status>> + Unpin,
+{
+    fn fail(&mut self, error: String) -> String {
+        self.error.get_or_insert(error).clone()
+    }
+
+    async fn send(&mut self, request: AppendRowsRequest) -> Result<(), String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        if self.pending.len() == MAX_IN_FLIGHT_REQUESTS {
+            self.acknowledge_next().await?;
+        }
+        let offset = request
+            .offset
+            .ok_or("AppendRows request is missing its offset")?;
+        self.requests
+            .send(request)
+            .await
+            .map_err(|_| self.fail("AppendRows request channel closed".into()))?;
+        self.pending.push_back(offset);
+        Ok(())
+    }
+
+    async fn acknowledge_next(&mut self) -> Result<(), String> {
+        let offset = self
+            .pending
+            .pop_front()
+            .ok_or("No pending AppendRows request")?;
+        let result = match self.responses.next().await {
+            Some(Ok(response)) => check_append(response, offset),
+            Some(Err(error)) => Err(format!("AppendRows response: {error}")),
+            None => Err("AppendRows closed before acknowledging a request".into()),
+        };
+        result.map_err(|error| self.fail(error))
+    }
+
+    async fn finish(self) -> Result<(), String> {
+        let Self {
+            requests,
+            mut responses,
+            mut pending,
+            mut error,
+        } = self;
+        // Half-close first, then drain all tail acknowledgements and the
+        // terminal status. Keep the first error, even if later appends succeed.
+        drop(requests);
+        while let Some(response) = responses.next().await {
+            let result = match response {
+                Ok(response) => match pending.pop_front() {
+                    Some(offset) => check_append(response, offset),
+                    None => Err("AppendRows returned an unexpected extra response".into()),
+                },
+                Err(status) => {
+                    error.get_or_insert_with(|| format!("AppendRows completion: {status}"));
+                    break;
+                }
+            };
+            if let Err(append_error) = result {
+                error.get_or_insert(append_error);
+            }
+        }
+        if !pending.is_empty() {
+            error.get_or_insert("AppendRows closed before acknowledging a request".into());
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
+async fn create_stream(
+    parent: &str,
+    compression: Option<CompressionEncoding>,
+) -> Result<(Client, String), String> {
+    let mut client = build_client(compression).await?;
     let mut attempt = 0;
     let response = loop {
         let result = client
@@ -322,7 +427,7 @@ async fn create_stream(parent: &str) -> Result<(Client, String), String> {
 async fn finalize_stream(name: &str, expected_rows: i64) -> Result<(), String> {
     // Fetch fresh credentials: a writer may have remained open longer than
     // the token used to establish its AppendRows connection.
-    let mut client = build_client().await?;
+    let mut client = build_client(None).await?;
     let response = client
         .finalize_write_stream(routed_request(
             FinalizeWriteStreamRequest { name: name.into() },
@@ -342,7 +447,7 @@ async fn finalize_stream(name: &str, expected_rows: i64) -> Result<(), String> {
 }
 
 async fn commit_streams(parent: &str, streams: Vec<String>) -> Result<(), String> {
-    let mut client = build_client().await?;
+    let mut client = build_client(None).await?;
     let response = client
         .batch_commit_write_streams(routed_request(
             BatchCommitWriteStreamsRequest {
@@ -361,6 +466,7 @@ async fn commit_streams(parent: &str, streams: Vec<String>) -> Result<(), String
 async fn worker(
     parent: String,
     schema: Arc<Vec<u8>>,
+    compression: WriteCompression,
     mut batches: mpsc::Receiver<RecordBatch>,
     failure: Arc<Failure>,
     abort: Arc<AtomicBool>,
@@ -375,7 +481,7 @@ async fn worker(
             continue;
         }
         if client_and_name.is_none() {
-            match create_stream(&parent).await {
+            match create_stream(&parent, compression.transport()).await {
                 Ok(stream) => client_and_name = Some(stream),
                 Err(error) => {
                     failure.record(error);
@@ -397,17 +503,16 @@ async fn worker(
                     connection.is_none().then_some(schema.as_slice()),
                     &piece,
                     MAX_REQUEST_BYTES,
+                    compression,
                 )?;
                 if let Some(connection) = connection.as_mut() {
                     connection.send(request).await?;
                 } else {
                     connection = Some(AppendConnection::open(client, request).await?);
                 }
-                connection
-                    .as_mut()
-                    .expect("append connection was initialized")
-                    .acknowledge(offset)
-                    .await?;
+                // Advance the sent offset as soon as the request is queued.
+                // AppendConnection checks ordered acknowledgements separately;
+                // finish() must drain them all before any stream can commit.
                 let rows_i64 = i64::try_from(rows).map_err(|_| "row count overflow".to_string())?;
                 offset = offset
                     .checked_add(rows_i64)
@@ -451,6 +556,7 @@ pub struct PyWriter {
     schema: SchemaRef,
     schema_ipc: Arc<Vec<u8>>,
     worker_count: usize,
+    compression: WriteCompression,
     next_worker: usize,
     workers: Vec<Worker>,
     failure: Arc<Failure>,
@@ -474,6 +580,7 @@ impl PyWriter {
             let task = runtime.spawn(worker(
                 self.parent.clone(),
                 self.schema_ipc.clone(),
+                self.compression,
                 receiver,
                 self.failure.clone(),
                 self.abort.clone(),
@@ -548,8 +655,14 @@ impl PyWriter {
 #[pymethods]
 impl PyWriter {
     #[new]
-    #[pyo3(signature = (parent, schema, worker_count=10))]
-    fn new(parent: String, schema: &Bound<'_, PyAny>, worker_count: usize) -> PyResult<Self> {
+    #[pyo3(signature = (parent, schema, worker_count=10, compression=None))]
+    fn new(
+        parent: String,
+        schema: &Bound<'_, PyAny>,
+        worker_count: usize,
+        compression: Option<&str>,
+    ) -> PyResult<Self> {
+        let compression = compression_from_str(compression).map_err(PyValueError::new_err)?;
         let parts: Vec<_> = parent.split('/').collect();
         if parts.len() != 6
             || parts[0] != "projects"
@@ -577,6 +690,7 @@ impl PyWriter {
             schema,
             schema_ipc,
             worker_count,
+            compression,
             next_worker: 0,
             workers: Vec::new(),
             failure: Arc::default(),
@@ -616,6 +730,238 @@ mod tests {
     use arrow::buffer::Buffer;
     use arrow::datatypes::{DataType, Field};
     use arrow::ipc::reader::StreamDecoder;
+    use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+
+    type TestConnection =
+        AppendConnection<ReceiverStream<Result<AppendRowsResponse, tonic::Status>>>;
+
+    fn test_connection() -> (
+        TestConnection,
+        mpsc::Receiver<AppendRowsRequest>,
+        mpsc::Sender<Result<AppendRowsResponse, tonic::Status>>,
+    ) {
+        let (requests, receiver) = mpsc::channel(MAX_IN_FLIGHT_REQUESTS);
+        let (responses, response_receiver) = mpsc::channel(MAX_IN_FLIGHT_REQUESTS + 2);
+        (
+            AppendConnection {
+                requests,
+                responses: ReceiverStream::new(response_receiver),
+                pending: VecDeque::new(),
+                error: None,
+            },
+            receiver,
+            responses,
+        )
+    }
+
+    fn request_at(offset: i64) -> AppendRowsRequest {
+        AppendRowsRequest {
+            offset: Some(offset),
+            ..Default::default()
+        }
+    }
+
+    fn ack_at(offset: i64) -> AppendRowsResponse {
+        AppendRowsResponse {
+            response: Some(Response::AppendResult(AppendResult {
+                offset: Some(offset),
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn pipelines_a_bounded_window_and_checks_acknowledgements_in_order() {
+        let (mut connection, mut requests, responses) = test_connection();
+        for index in 0..MAX_IN_FLIGHT_REQUESTS {
+            connection
+                .send(request_at(index as i64 * 10))
+                .await
+                .unwrap();
+            assert_eq!(
+                requests.recv().await.unwrap().offset,
+                Some(index as i64 * 10)
+            );
+        }
+        assert_eq!(connection.pending.len(), MAX_IN_FLIGHT_REQUESTS);
+        // All four appends reached the server without any acknowledgement.
+        // A fifth must wait for the oldest response before it can be sent.
+        let next_offset = MAX_IN_FLIGHT_REQUESTS as i64 * 10;
+        let mut fifth = Box::pin(connection.send(request_at(next_offset)));
+        assert!(futures::poll!(fifth.as_mut()).is_pending());
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        responses.send(Ok(ack_at(0))).await.unwrap();
+        fifth.await.unwrap();
+        assert_eq!(requests.recv().await.unwrap().offset, Some(next_offset));
+        assert_eq!(connection.pending.len(), MAX_IN_FLIGHT_REQUESTS);
+        for index in 1..=MAX_IN_FLIGHT_REQUESTS {
+            responses.send(Ok(ack_at(index as i64 * 10))).await.unwrap();
+        }
+        drop(responses);
+        connection.finish().await.unwrap();
+        assert!(requests.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn half_closes_before_waiting_for_tail_acknowledgements() {
+        let (mut connection, mut requests, responses) = test_connection();
+        let server = tokio::spawn(async move {
+            let mut offsets = Vec::new();
+            while let Some(request) = requests.recv().await {
+                offsets.push(request.offset.unwrap());
+            }
+            // A server is allowed to delay its responses until half-close.
+            for offset in &offsets {
+                responses.send(Ok(ack_at(*offset))).await.unwrap();
+            }
+            offsets
+        });
+        for offset in [0, 10, 20] {
+            connection.send(request_at(offset)).await.unwrap();
+        }
+        connection.finish().await.unwrap();
+        assert_eq!(server.await.unwrap(), vec![0, 10, 20]);
+    }
+
+    #[tokio::test]
+    async fn missing_tail_acknowledgements_prevent_success() {
+        let (mut connection, _requests, responses) = test_connection();
+        connection.send(request_at(0)).await.unwrap();
+        connection.send(request_at(10)).await.unwrap();
+        responses.send(Ok(ack_at(0))).await.unwrap();
+        drop(responses);
+        assert!(connection
+            .finish()
+            .await
+            .unwrap_err()
+            .contains("before acknowledging"));
+    }
+
+    #[tokio::test]
+    async fn extra_responses_prevent_success() {
+        let (mut connection, _requests, responses) = test_connection();
+        connection.send(request_at(0)).await.unwrap();
+        responses.send(Ok(ack_at(0))).await.unwrap();
+        responses.send(Ok(ack_at(10))).await.unwrap();
+        drop(responses);
+        assert!(connection
+            .finish()
+            .await
+            .unwrap_err()
+            .contains("extra response"));
+    }
+
+    #[tokio::test]
+    async fn terminal_error_after_all_acknowledgements_prevents_success() {
+        let (mut connection, _requests, responses) = test_connection();
+        connection.send(request_at(0)).await.unwrap();
+        responses.send(Ok(ack_at(0))).await.unwrap();
+        responses
+            .send(Err(tonic::Status::unavailable("connection lost")))
+            .await
+            .unwrap();
+        drop(responses);
+        assert!(connection
+            .finish()
+            .await
+            .unwrap_err()
+            .contains("connection lost"));
+    }
+
+    #[tokio::test]
+    async fn drains_tail_responses_after_an_error_and_preserves_the_first_error() {
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = observed.clone();
+        let (requests, mut receiver) = mpsc::channel(1);
+        let responses = futures::stream::iter(vec![
+            Ok(ack_at(99)),
+            Ok(AppendRowsResponse {
+                row_errors: vec![RowError::default()],
+                ..ack_at(10)
+            }),
+            Ok(ack_at(20)),
+            Err(tonic::Status::unavailable("later failure")),
+        ])
+        .inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let connection = AppendConnection {
+            requests,
+            responses,
+            pending: VecDeque::from([0, 10, 20]),
+            error: None,
+        };
+        let error = connection.finish().await.unwrap_err();
+        assert!(error.contains("offset Some(99), expected 0"));
+        assert_eq!(observed.load(Ordering::SeqCst), 4);
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bad_window_acknowledgement_stops_new_appends() {
+        let (mut connection, mut requests, responses) = test_connection();
+        for index in 0..MAX_IN_FLIGHT_REQUESTS {
+            connection
+                .send(request_at(index as i64 * 10))
+                .await
+                .unwrap();
+            requests.recv().await.unwrap();
+        }
+        responses.send(Ok(ack_at(99))).await.unwrap();
+        let error = connection.send(request_at(40)).await.unwrap_err();
+        assert!(error.contains("offset"));
+        assert_eq!(connection.send(request_at(40)).await.unwrap_err(), error);
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        for index in 1..MAX_IN_FLIGHT_REQUESTS {
+            responses.send(Ok(ack_at(index as i64 * 10))).await.unwrap();
+        }
+        drop(responses);
+        assert_eq!(connection.finish().await.unwrap_err(), error);
+    }
+
+    #[tokio::test]
+    async fn closed_request_channel_stops_new_appends_and_poison_is_preserved() {
+        let (mut connection, requests, responses) = test_connection();
+        drop(requests);
+        let error = connection.send(request_at(0)).await.unwrap_err();
+        assert!(error.contains("request channel closed"));
+        assert!(connection.pending.is_empty());
+        assert_eq!(connection.send(request_at(10)).await.unwrap_err(), error);
+        drop(responses);
+        assert_eq!(connection.finish().await.unwrap_err(), error);
+    }
+
+    #[test]
+    fn validates_write_compression() {
+        for (value, expected) in [
+            (None, WriteCompression::Uncompressed),
+            (Some("gzip"), WriteCompression::Gzip),
+            (Some("lz4"), WriteCompression::Lz4),
+            (Some("zstd"), WriteCompression::Zstd),
+        ] {
+            let compression = compression_from_str(value).unwrap();
+            assert_eq!(compression, expected);
+            assert!(compression.transport().is_none() || compression.arrow().is_none());
+        }
+        for value in ["snappy", "brotli", "GZIP", ""] {
+            assert!(compression_from_str(Some(value))
+                .unwrap_err()
+                .contains("Unsupported write compression"));
+        }
+    }
+
+    const COMPRESSIONS: [WriteCompression; 4] = [
+        WriteCompression::Uncompressed,
+        WriteCompression::Gzip,
+        WriteCompression::Lz4,
+        WriteCompression::Zstd,
+    ];
 
     fn batch() -> RecordBatch {
         RecordBatch::try_new(
@@ -628,73 +974,122 @@ mod tests {
     #[test]
     fn ipc_is_one_schema_and_one_batch_message() {
         let batch = batch();
-        let mut decoder = StreamDecoder::new();
-        let mut schema = Buffer::from(schema_ipc(&batch.schema()).unwrap());
-        assert!(decoder.decode(&mut schema).unwrap().is_none());
-        assert!(schema.is_empty());
-        let mut encoded = Buffer::from(batch_ipc(&batch).unwrap());
-        assert_eq!(decoder.decode(&mut encoded).unwrap().unwrap(), batch);
-        assert!(encoded.is_empty());
+        let plain_size = batch_ipc(&batch, WriteCompression::Uncompressed)
+            .unwrap()
+            .len();
+        for compression in COMPRESSIONS {
+            let mut decoder = StreamDecoder::new();
+            let mut schema = Buffer::from(schema_ipc(&batch.schema()).unwrap());
+            assert!(decoder.decode(&mut schema).unwrap().is_none());
+            assert!(schema.is_empty());
+            let bytes = batch_ipc(&batch, compression).unwrap();
+            let metadata = arrow::ipc::root_as_message(&bytes[8..]).unwrap();
+            assert_eq!(
+                metadata
+                    .header_as_record_batch()
+                    .unwrap()
+                    .compression()
+                    .map(|c| c.codec()),
+                compression.arrow()
+            );
+            if compression.arrow().is_some() {
+                assert!(bytes.len() < plain_size);
+            }
+            let mut encoded = Buffer::from(bytes);
+            assert_eq!(decoder.decode(&mut encoded).unwrap().unwrap(), batch);
+            assert!(encoded.is_empty());
+        }
     }
 
     #[test]
     fn splits_using_complete_request_size_and_preserves_rows() {
-        let batch = batch();
+        // Distinct data keeps the full batch larger than a single row for all
+        // codecs. Highly repetitive data can have non-monotonic encoded sizes.
+        let mut state = 17_u64;
+        let values: Vec<String> = (0..8)
+            .map(|_| {
+                (0..500)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        char::from(32 + ((state >> 32) % 95) as u8)
+                    })
+                    .collect()
+            })
+            .collect();
+        let batch =
+            RecordBatch::try_new(batch().schema(), vec![Arc::new(StringArray::from(values))])
+                .unwrap();
         let schema = schema_ipc(&batch.schema()).unwrap();
         let stream = "projects/p/datasets/d/tables/t/streams/12345";
-        let limit = 1600;
-        let mut start = 0;
-        let mut recovered = Vec::new();
-        while start < batch.num_rows() {
-            let (request, rows) = fitting_request(
-                stream,
-                start as i64,
-                (start == 0).then_some(schema.as_slice()),
-                &batch.slice(start, batch.num_rows() - start),
-                limit,
-            )
-            .unwrap();
-            assert!(request.encoded_len() < limit);
-            assert_eq!(request.offset, Some(start as i64));
-            let Some(Rows::ArrowRows(data)) = request.rows else {
-                panic!("not Arrow")
-            };
-            assert_eq!(data.writer_schema.is_some(), start == 0);
-            let mut decoder = StreamDecoder::new();
-            decoder.decode(&mut Buffer::from(schema.clone())).unwrap();
-            recovered.push(
-                decoder
-                    .decode(&mut Buffer::from(
-                        data.rows.unwrap().serialized_record_batch,
-                    ))
-                    .unwrap()
-                    .unwrap(),
+        for compression in COMPRESSIONS {
+            // Force the complete batch to split, using the actual compressed size.
+            let limit = append_request(stream, 0, Some(&schema), &batch, compression)
+                .unwrap()
+                .encoded_len();
+            let mut start = 0;
+            let mut recovered = Vec::new();
+            while start < batch.num_rows() {
+                let (request, rows) = fitting_request(
+                    stream,
+                    start as i64,
+                    (start == 0).then_some(schema.as_slice()),
+                    &batch.slice(start, batch.num_rows() - start),
+                    limit,
+                    compression,
+                )
+                .unwrap();
+                assert!(request.encoded_len() < limit);
+                assert_eq!(request.offset, Some(start as i64));
+                let Some(Rows::ArrowRows(data)) = request.rows else {
+                    panic!("not Arrow")
+                };
+                assert_eq!(data.writer_schema.is_some(), start == 0);
+                let mut decoder = StreamDecoder::new();
+                decoder.decode(&mut Buffer::from(schema.clone())).unwrap();
+                recovered.push(
+                    decoder
+                        .decode(&mut Buffer::from(
+                            data.rows.unwrap().serialized_record_batch,
+                        ))
+                        .unwrap()
+                        .unwrap(),
+                );
+                start += rows;
+            }
+            assert!(recovered.len() > 1);
+            assert_eq!(
+                arrow::compute::concat_batches(&batch.schema(), &recovered).unwrap(),
+                batch
             );
-            start += rows;
         }
-        assert!(recovered.len() > 1);
-        assert_eq!(
-            arrow::compute::concat_batches(&batch.schema(), &recovered).unwrap(),
-            batch
-        );
     }
 
     #[test]
     fn rejects_oversized_single_row_including_schema() {
         let batch = batch().slice(0, 1);
         let schema = schema_ipc(&batch.schema()).unwrap();
-        let request = append_request("stream", 0, Some(&schema), &batch).unwrap();
-        let error =
-            fitting_request("stream", 0, Some(&schema), &batch, request.encoded_len()).unwrap_err();
-        assert!(error.contains("single Arrow row"));
-        assert!(fitting_request(
-            "stream",
-            0,
-            Some(&schema),
-            &batch,
-            request.encoded_len() + 1
-        )
-        .is_ok());
+        for compression in COMPRESSIONS {
+            let request = append_request("stream", 0, Some(&schema), &batch, compression).unwrap();
+            let error = fitting_request(
+                "stream",
+                0,
+                Some(&schema),
+                &batch,
+                request.encoded_len(),
+                compression,
+            )
+            .unwrap_err();
+            assert!(error.contains("single Arrow row"));
+            assert!(fitting_request(
+                "stream",
+                0,
+                Some(&schema),
+                &batch,
+                request.encoded_len() + 1,
+                compression,
+            )
+            .is_ok());
+        }
     }
 
     #[test]
@@ -756,6 +1151,7 @@ mod tests {
             schema: schema.clone(),
             schema_ipc: Arc::new(schema_ipc(&schema).unwrap()),
             worker_count: 2,
+            compression: WriteCompression::Uncompressed,
             next_worker: 0,
             workers: Vec::new(),
             failure: Arc::default(),

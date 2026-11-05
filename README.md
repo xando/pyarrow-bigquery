@@ -287,11 +287,61 @@ retain their existing meanings. `worker_count` limits the native write streams;
 path uses bounded queues and does not create temporary Feather files or Python
 worker threads/processes.
 
+Each Rust stream pipelines up to four unacknowledged append requests. Requests
+and worker queues remain bounded; all acknowledgements and the final stream
+status are checked before committing. Increase `worker_count` to use more
+streams when your workload benefits from additional concurrency.
+
+For bulk uploads, set `batch_size` explicitly (`write_table` defaults to 10 rows).
+For example, start with the following and measure worker counts on your workload:
+
+```python
+bq.write_table(
+    table, "my_project.my_dataset.events",
+    engine="rust", compression="zstd",
+    worker_count=8, batch_size=50_000,
+)
+```
+
+Both engines support `compression="gzip"` to compress outgoing gRPC requests:
+
+```python
+bq.write_table(table, "my_project.my_dataset.events", compression="gzip")
+
+with bq.writer(table.schema, "my_project.my_dataset.events",
+               engine="rust", compression="gzip", table_create=False) as w:
+    w.write_table(table)
+```
+
+The Rust writer also supports `compression="lz4"` and `compression="zstd"`
+using Arrow buffer compression, matching the read APIs:
+
+```python
+bq.write_table(table, "my_project.my_dataset.events", engine="rust",
+               compression="zstd", worker_count=8, batch_size=50_000)
+table_back = bq.read_table("my_project.my_dataset.events", engine="rust",
+                          compression="zstd")
+```
+
+| Engine | Read compression | Write compression |
+| --- | --- | --- |
+| `"python"` | `None`, `"lz4"`, `"zstd"` | `None`, `"gzip"` |
+| `"rust"` | `None`, `"lz4"`, `"zstd"` | `None`, `"lz4"`, `"zstd"`, `"gzip"` |
+
+Compression defaults to `None` (disabled). LZ4/Zstandard compress Arrow buffers;
+gzip compresses gRPC requests. Each write selects one compression layer. The
+Python writer sends protobuf rows and rejects LZ4/Zstandard before creating a
+table. Rust checks the complete request size after Arrow encoding and before
+gRPC compression, including the schema on the first request.
+
 Rust writes use pending streams. A successful context exit waits for all appends,
 finalizes the streams, and commits them together. A write failure or exception in
 the context prevents that commit. Table creation and overwrite happen separately
 and are not rolled back. As with other remote commits, an error receiving the
 commit response can leave its outcome uncertain.
+
+Append connection failures are reported to the caller. Automatic reconnect and
+replay of outstanding Rust append requests are not implemented.
 
 The Rust engine validates schema support before creating or overwriting a table.
 It normalizes timestamps to UTC microseconds (naive timestamps are interpreted as
@@ -358,6 +408,8 @@ Writes a PyArrow table to BigQuery. Returns nothing.
 - `worker_type`: `threading.Thread | multiprocessing.Process`, *default* `threading.Thread`.
 - `worker_count`: `int`, *default* `os.cpu_count()`.
 - `batch_size`: `int`, *default* `10` — rows per upload chunk inside the call.
+- `compression`: `None | "gzip" | "lz4" | "zstd"`, *default* `None` — gzip compresses
+  gRPC requests with either engine; LZ4/Zstandard compress Arrow buffers with Rust.
 - `engine`: `"python" | "rust"`, *default* `"python"` — implementation selector;
   see [Write engines](#write-engines-enginepython-vs-rust).
 
@@ -369,7 +421,7 @@ bq.write_table(table, "my_project.my_dataset.out")
 
 Incremental writes. Constructor: `writer(schema, where, **options)`.
 
-**Parameters:** same table-creation, worker, and `engine` options as `write_table`
+**Parameters:** same table-creation, worker, `compression`, and `engine` options as `write_table`
 (no `batch_size` on the context manager itself).
 
 **Methods:**

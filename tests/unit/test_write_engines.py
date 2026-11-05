@@ -73,6 +73,7 @@ def test_rust_writer_passes_arrow_batches_without_python_workers(rust_backend, m
         "parent": "projects/destination/datasets/dataset/tables/table",
         "schema": table.schema,
         "worker_count": 3,
+        "compression": None,
     }
     assert rust_backend.events == [
         "validate",
@@ -250,7 +251,8 @@ def test_rust_write_requires_open_context(rust_backend, method):
         getattr(w, method)(data)
 
 
-def test_rust_write_table_wrapper_preserves_chunking_and_options(rust_backend):
+@pytest.mark.parametrize("compression", [None, "gzip", "lz4", "zstd"])
+def test_rust_write_table_wrapper_preserves_chunking_and_options(rust_backend, compression):
     table = pa.table({"x": [1, 2, 3, 4, 5]})
     result = rust_backend.module.write_table(
         table,
@@ -259,10 +261,12 @@ def test_rust_write_table_wrapper_preserves_chunking_and_options(rust_backend):
         worker_count=2,
         table_create=False,
         batch_size=2,
+        compression=compression,
     )
     assert result is None
     native = rust_backend.instances[0]
     assert native.options["worker_count"] == 2
+    assert native.options["compression"] == compression
     assert [b.num_rows for b in native.batches] == [2, 2, 1]
     assert native.commits == [True]
     assert rust_backend.events == ["validate"]
@@ -283,7 +287,8 @@ def test_default_writer_preserves_python_workers(rust_backend, monkeypatch):
     write_mod = rust_backend.module
     received = []
 
-    def worker(parent, schema_protobuf, queue_results, queue_worker_status):
+    def worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
+        assert compression is None
         received.append((parent, schema_protobuf))
         assert queue_results.get(timeout=1) is None
         queue_worker_status.put((write_mod._QUEUE_DONE, None))
@@ -303,3 +308,27 @@ def test_default_writer_preserves_python_workers(rust_backend, monkeypatch):
         assert w.queue_results.maxsize == 4
     assert received == [("projects/project/datasets/dataset/tables/table", descriptor)]
     assert rust_backend.instances == []
+
+
+@pytest.mark.parametrize("engine", ["python", "rust"])
+@pytest.mark.parametrize("compression", ["snappy", "brotli", "GZIP", "", False, []])
+def test_write_rejects_unknown_compression_before_side_effects(rust_backend, engine, compression):
+    with pytest.raises(ValueError, match="Unsupported write compression"):
+        rust_backend.module.write_table(
+            pa.table({"x": [1]}),
+            "project.dataset.table",
+            engine=engine,
+            compression=compression,
+            table_overwrite=True,
+        )
+    assert rust_backend.events == []
+
+
+@pytest.mark.parametrize("compression", ["lz4", "zstd"])
+def test_python_writer_rejects_arrow_compression_before_side_effects(rust_backend, compression):
+    with pytest.raises(ValueError, match="Unsupported write compression.*engine='python'"):
+        rust_backend.module.write_table(
+            pa.table({"x": [1]}), "project.dataset.table",
+            engine="python", compression=compression, table_overwrite=True,
+        )
+    assert rust_backend.events == []

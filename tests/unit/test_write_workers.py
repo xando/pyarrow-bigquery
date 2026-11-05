@@ -1,7 +1,9 @@
 import importlib
 
+import grpc
 import pyarrow as pa
 import pytest
+from google.auth.credentials import AnonymousCredentials
 
 
 def test_stream_worker_reports_errors(monkeypatch):
@@ -29,7 +31,7 @@ def test_stream_worker_reports_errors(monkeypatch):
 def test_writer_surfaces_worker_errors(monkeypatch):
     write_mod = importlib.import_module("pyarrow.bigquery.write")
 
-    def failing_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status):
+    def failing_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
         queue_worker_status.put(
             write_mod._queue_error(RuntimeError("upload failed"))
         )
@@ -57,11 +59,14 @@ def test_writer_validates_worker_type():
 
 
 @pytest.mark.parametrize("write_method", ["write_table", "write_batch"])
-def test_writer_passes_complete_feather_files_to_workers(monkeypatch, write_method):
+@pytest.mark.parametrize("compression", [None, "gzip"])
+def test_writer_passes_complete_feather_files_to_workers(monkeypatch, write_method, compression):
     write_mod = importlib.import_module("pyarrow.bigquery.write")
     uploaded = []
+    worker_compressions = []
 
-    def fake_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status):
+    def fake_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
+        worker_compressions.append(compression)
         while (path := queue_results.get()) is not None:
             uploaded.append(write_mod.fa.read_table(path))
             write_mod.os.remove(path)
@@ -73,18 +78,21 @@ def test_writer_passes_complete_feather_files_to_workers(monkeypatch, write_meth
 
     table = pa.table({"x": [1, 2, 3]})
     data = table if write_method == "write_table" else table.to_batches()[0]
-    with write_mod.writer(table.schema, "project.dataset.table", worker_count=1) as w:
+    with write_mod.writer(
+        table.schema, "project.dataset.table", worker_count=1, compression=compression
+    ) as w:
         getattr(w, write_method)(data)
 
     assert len(uploaded) == 1
     assert uploaded[0].equals(table)
+    assert worker_compressions == [compression]
     assert not write_mod.os.path.exists(w.temp_dir)
 
 
 def test_writer_uses_bounded_queue(monkeypatch):
     write_mod = importlib.import_module("pyarrow.bigquery.write")
 
-    def fake_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status):
+    def fake_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
         queue_worker_status.put((write_mod._QUEUE_DONE, None))
 
     monkeypatch.setattr(write_mod, "_stream_worker", fake_stream_worker)
@@ -120,3 +128,59 @@ def test_stream_worker_closes_client_transport(monkeypatch):
     write_mod._stream_worker("projects/p/datasets/d/tables/t", object(), queue_results, queue_worker_status)
 
     assert closed == [True]
+
+
+def test_gzip_worker_configures_transport_uploads_and_closes(monkeypatch, tmp_path):
+    write_mod = importlib.import_module("pyarrow.bigquery.write")
+    transport_cls = write_mod.BigQueryWriteGrpcTransport
+    create_channel = transport_cls.create_channel
+    close_transport = transport_cls.close
+    channel_options = []
+    uploaded = []
+    closed = []
+
+    def compressed_channel(**kwargs):
+        channel_options.append(kwargs)
+        # Creating a channel does not connect to the service. No credentials or
+        # network are used; the upload and finalization below stay local.
+        return create_channel(credentials=AnonymousCredentials(), **kwargs)
+
+    def close(self):
+        closed.append(self)
+        return close_transport(self)
+
+    def create_stream(client, parent, schema):
+        assert isinstance(client.transport, transport_cls)
+        return object()
+
+    monkeypatch.setattr(transport_cls, "create_channel", compressed_channel)
+    monkeypatch.setattr(transport_cls, "close", close)
+    monkeypatch.setattr(write_mod, "_bq_write_create_stream", create_stream)
+    monkeypatch.setattr(write_mod, "_bq_storage_close_stream", lambda *args: None)
+    monkeypatch.setattr(
+        write_mod.upload, "upload_data",
+        lambda stream, table, schema, offset: uploaded.append((table, offset)),
+    )
+    table = pa.table({"value": ["repeat" * 100] * 3})
+    path = tmp_path / "batch.feather"
+    write_mod.fa.write_feather(table, path)
+    results = write_mod.queue.Queue()
+    status = write_mod.queue.Queue()
+    results.put(str(path))
+    results.put(None)
+
+    write_mod._stream_worker("projects/p/datasets/d/tables/t", object(), results, status, "gzip")
+
+    assert status.get_nowait() == (write_mod._QUEUE_DONE, None)
+    assert channel_options == [{
+        "compression": grpc.Compression.Gzip,
+        "options": [
+            ("grpc.max_send_message_length", -1),
+            ("grpc.max_receive_message_length", -1),
+        ],
+    }]
+    assert len(uploaded) == 1
+    assert uploaded[0][0].equals(table)
+    assert uploaded[0][1] == 0
+    assert not path.exists()
+    assert len(closed) == 1

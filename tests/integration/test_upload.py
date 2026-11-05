@@ -24,10 +24,13 @@ def _remove_table(LOCATION):
 
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
-def test_simple(LOCATION, engine):
+@pytest.mark.parametrize("compression", [None, "gzip"])
+def test_simple(LOCATION, engine, compression):
     table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
 
-    bq.write_table(table, LOCATION, table_create=True, engine=engine)
+    bq.write_table(
+        table, LOCATION, table_create=True, engine=engine, compression=compression, worker_count=2
+    )
 
     table_back = bq.read_table(LOCATION)
 
@@ -54,10 +57,14 @@ def test_reader_query(LOCATION):
 
 
 @pytest.mark.parametrize("engine", ["python", "rust"])
-def test_context(LOCATION, engine):
+@pytest.mark.parametrize("compression", [None, "gzip"])
+def test_context(LOCATION, engine, compression):
     table = pa.Table.from_arrays([[1, 2, 3, 4]], names=["test"])
 
-    with bq.writer(table.schema, LOCATION, table_create=True, engine=engine) as w:
+    with bq.writer(
+        table.schema, LOCATION, table_create=True, engine=engine, compression=compression,
+        worker_count=2,
+    ) as w:
         w.write_table(table)
 
     with bq.reader(LOCATION) as r:
@@ -167,6 +174,38 @@ def test_rust_write_batch_appends_to_existing_table(LOCATION):
         w.write_batch(batch)
 
     assert bq.read_table(LOCATION).sort_by("value").to_pydict() == {"value": [1, 2, 3, 4]}
+
+
+@pytest.mark.parametrize("compression", [None, "gzip", "lz4", "zstd"])
+def test_rust_pipelined_batches_preserve_rows(LOCATION, compression):
+    table = pa.table({
+        "id": range(2_000),
+        "value": [f"value-{i}" for i in range(2_000)],
+    })
+    with bq.writer(
+        table.schema, LOCATION, engine="rust", compression=compression, worker_count=2
+    ) as w:
+        # Multiple full windows and a partial tail on each stream.
+        for batch in table.to_batches(max_chunksize=137):
+            w.write_batch(batch)
+    read_compression = None if compression == "gzip" else compression
+    assert bq.read_table(
+        LOCATION, engine="rust", compression=read_compression, worker_count=2
+    ).sort_by("id").equals(table)
+
+
+@pytest.mark.parametrize("compression", ["lz4", "zstd"])
+def test_rust_arrow_compression_roundtrips_nested_values(LOCATION, compression):
+    table = pa.table({
+        "id": [0, 1, 2],
+        "text": ["repeat" * 1000, None, "last"],
+        "items": pa.array([[1, 2], [], [3]], type=pa.list_(pa.int64())),
+        "record": [{"label": "first", "value": 1},
+                   {"label": None, "value": 2}, {"label": "last", "value": None}],
+    })
+    bq.write_table(table, LOCATION, engine="rust", compression=compression, worker_count=2)
+    result = bq.read_table(LOCATION, engine="rust", compression=compression, worker_count=2)
+    assert result.sort_by("id").to_pylist() == table.to_pylist()
 
 
 def test_rust_context_exception_does_not_commit_rows(LOCATION):
