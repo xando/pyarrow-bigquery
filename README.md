@@ -342,6 +342,12 @@ or an exception escaping the context prevents that commit. Table creation and ov
 and are not rolled back. As with other remote commits, an error receiving the
 commit response can leave its outcome uncertain.
 
+Python enqueue operations poll worker health while applying backpressure. Healthy
+uploads finish before worker shutdown; the shutdown grace period is not an upload
+deadline. Worker and Feather serialization failures remain fatal even if caught
+inside the context. Exceptional exit cancels queued work and acknowledgement
+waits rather than enqueueing shutdown sentinels into a full queue.
+
 Append connection failures are reported to the caller. Automatic reconnect and
 replay of outstanding Rust append requests are not implemented.
 

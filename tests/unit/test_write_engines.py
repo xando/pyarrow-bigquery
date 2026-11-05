@@ -287,7 +287,10 @@ def test_default_writer_preserves_python_workers(rust_backend, monkeypatch):
     write_mod = rust_backend.module
     received = []
 
-    def worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
+    def worker(
+        parent, schema_protobuf, queue_results, queue_worker_status,
+        compression=None, stop_event=None,
+    ):
         assert compression is None
         received.append((parent, schema_protobuf))
         assert queue_results.get(timeout=1) is None

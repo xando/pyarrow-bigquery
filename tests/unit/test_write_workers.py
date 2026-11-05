@@ -31,7 +31,10 @@ def test_stream_worker_reports_errors(monkeypatch):
 def test_writer_surfaces_worker_errors(monkeypatch):
     write_mod = importlib.import_module("pyarrow.bigquery.write")
 
-    def failing_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
+    def failing_stream_worker(
+        parent, schema_protobuf, queue_results, queue_worker_status,
+        compression=None, stop_event=None,
+    ):
         queue_worker_status.put(
             write_mod._queue_error(RuntimeError("upload failed"))
         )
@@ -65,7 +68,10 @@ def test_writer_passes_complete_feather_files_to_workers(monkeypatch, write_meth
     uploaded = []
     worker_compressions = []
 
-    def fake_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
+    def fake_stream_worker(
+        parent, schema_protobuf, queue_results, queue_worker_status,
+        compression=None, stop_event=None,
+    ):
         worker_compressions.append(compression)
         while (path := queue_results.get()) is not None:
             uploaded.append(write_mod.fa.read_table(path))
@@ -92,7 +98,10 @@ def test_writer_passes_complete_feather_files_to_workers(monkeypatch, write_meth
 def test_writer_uses_bounded_queue(monkeypatch):
     write_mod = importlib.import_module("pyarrow.bigquery.write")
 
-    def fake_stream_worker(parent, schema_protobuf, queue_results, queue_worker_status, compression=None):
+    def fake_stream_worker(
+        parent, schema_protobuf, queue_results, queue_worker_status,
+        compression=None, stop_event=None,
+    ):
         queue_worker_status.put((write_mod._QUEUE_DONE, None))
 
     monkeypatch.setattr(write_mod, "_stream_worker", fake_stream_worker)
