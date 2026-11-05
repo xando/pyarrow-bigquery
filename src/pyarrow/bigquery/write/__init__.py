@@ -324,6 +324,12 @@ class writer:
             raise RuntimeError("BigQuery writer is not open; use it inside a with block")
         return self._rust_writer
 
+    def _validate_python_schema(self, schema: pa.Schema):
+        # Names, order, types (including nested fields) and nullability affect
+        # protobuf serialization. Metadata does not change the wire schema.
+        if not schema.equals(self.schema, check_metadata=False):
+            raise ValueError("Input schema does not match the writer schema")
+
     def write_table(self, table):
         if self.engine == "rust":
             rust_writer = self._open_rust_writer()
@@ -331,6 +337,7 @@ class writer:
                 rust_writer.write_batch(batch)
             return
 
+        self._validate_python_schema(table.schema)
         fd, element = tempfile.mkstemp(dir=self.temp_dir)
         os.close(fd)
         fa.write_feather(table, element)
@@ -341,6 +348,7 @@ class writer:
             self._open_rust_writer().write_batch(batch)
             return
 
+        self._validate_python_schema(batch.schema)
         fd, element = tempfile.mkstemp(dir=self.temp_dir)
         os.close(fd)
         fa.write_feather(pa.Table.from_batches([batch]), element)
