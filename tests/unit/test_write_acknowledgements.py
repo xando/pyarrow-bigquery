@@ -1,5 +1,6 @@
 import importlib
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -72,7 +73,7 @@ def test_async_append_failure_stops_sending_new_requests(monkeypatch):
 
 def test_missing_future_response_times_out(monkeypatch):
     monkeypatch.setattr(upload, "_APPEND_TIMEOUT", 0)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(FutureTimeoutError):
         upload._acknowledge(Future(), 0)
 
 
