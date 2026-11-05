@@ -13,7 +13,9 @@ def test_thread_reader_uses_thread_queue_without_manager(monkeypatch):
     class FakeReadClient:
         pass
 
-    def fake_stream_worker(read_streams, table_schema, batch_size, queue_results, ipc_exchange):
+    def fake_stream_worker(
+        read_streams, table_schema, batch_size, queue_results, ipc_exchange, stop_event=None,
+    ):
         table = pa.table({"x": [1]})
         queue_results.put(read_mod._queue_result(ipc_exchange.store(table)))
         queue_results.put((read_mod._QUEUE_DONE, None))

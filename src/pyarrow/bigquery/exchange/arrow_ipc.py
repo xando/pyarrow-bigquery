@@ -32,6 +32,9 @@ class ArrowIpc(ConcurrencyCompatible):
 
         return file_name
 
+    def discard(self, key: str) -> None:
+        _unlink(key)
+
     def load(self, key: str) -> pa.Table:
         with pa.memory_map(key, "r") as source:
             with pa.ipc.open_file(source) as reader:

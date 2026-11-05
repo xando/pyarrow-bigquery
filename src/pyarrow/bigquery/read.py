@@ -117,21 +117,56 @@ def _bq_read_create_streams(
     return ([s.name for s in read_session.streams], schema)
 
 
+def _put_worker_message(queue_results, message, stop_event):
+    while stop_event is None or not stop_event.is_set():
+        try:
+            queue_results.put(message, timeout=_QUEUE_GET_TIMEOUT)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _discard_result(ipc_exchange, key):
+    try:
+        # Preserve compatibility with third-party exchanges implementing only
+        # store/load. Built-in file exchanges can discard without decoding.
+        getattr(ipc_exchange, "discard", ipc_exchange.load)(key)
+    except Exception:
+        logger.exception("Failed to discard unread BigQuery result %r", key)
+
+
+def _put_worker_table(queue_results, ipc_exchange, table, stop_event):
+    key = ipc_exchange.store(table)
+    delivered = False
+    try:
+        delivered = _put_worker_message(queue_results, _queue_result(key), stop_event)
+        return delivered
+    finally:
+        if not delivered:
+            _discard_result(ipc_exchange, key)
+
+
 def _stream_worker(
     read_streams: list[str],
     table_schema: pa.Schema,
     batch_size: int,
     queue_results: multiprocessing.Queue | queue.Queue,
     ipc_exchange,
+    stop_event=None,
 ):
     read_client = None
     try:
         read_client = bigquery_storage.BigQueryReadClient()
         batches = []
         for stream in read_streams:
+            if stop_event is not None and stop_event.is_set():
+                return
             t = time.time()
 
             for message in read_client.read_rows(stream):
+                if stop_event is not None and stop_event.is_set():
+                    return
                 record_batch = pa.ipc.read_record_batch(
                     message.arrow_record_batch.serialized_record_batch,
                     table_schema,
@@ -141,18 +176,23 @@ def _stream_worker(
 
                 while batches and sum(b.num_rows for b in batches) >= batch_size:
                     table = pa.Table.from_batches(batches)
-                    queue_results.put(_queue_result(ipc_exchange.store(table[:batch_size])))
+                    if not _put_worker_table(
+                        queue_results, ipc_exchange, table[:batch_size], stop_event
+                    ):
+                        return
                     batches = table[batch_size:].to_batches()
 
             logger.debug(f"Stream {stream} done in {time.time() - t:.2f} seconds")
 
         if batches:
-            queue_key = ipc_exchange.store(pa.Table.from_batches(batches))
-            queue_results.put(_queue_result(queue_key))
+            if not _put_worker_table(
+                queue_results, ipc_exchange, pa.Table.from_batches(batches), stop_event
+            ):
+                return
 
-        queue_results.put((_QUEUE_DONE, None))
+        _put_worker_message(queue_results, (_QUEUE_DONE, None), stop_event)
     except BaseException as exc:
-        queue_results.put(_queue_error(exc))
+        _put_worker_message(queue_results, _queue_error(exc), stop_event)
     finally:
         _close_client_transport(read_client)
 
@@ -329,14 +369,15 @@ class reader:
         assert isinstance(
             self.compression, bigquery_storage.ArrowSerializationOptions.CompressionCodec
         )
-        queue_maxsize = 0
-        if type(self.ipc_exchange) is exchange.SharedMemory:
-            # Limit in-flight shm segments while the main process drains the queue.
-            queue_maxsize = max(4, self.worker_count * 2)
+        # Bound read-ahead for every exchange, not just shared memory. Each
+        # worker may additionally own one result while waiting to enqueue it.
+        queue_maxsize = max(4, self.worker_count * 2)
         if self.worker_type == threading.Thread:
             self.queue_results = queue.Queue(maxsize=queue_maxsize)
+            self.stop_event = threading.Event()
         else:
             self.queue_results = multiprocessing.Queue(maxsize=queue_maxsize)
+            self.stop_event = multiprocessing.Event()
         self.read_client = bigquery_storage.BigQueryReadClient()
         self.workers = []
 
@@ -382,6 +423,7 @@ class reader:
                     self.batch_size,
                     self.queue_results,
                     self.ipc_exchange,
+                    self.stop_event,
                 ),
             )
             if self.worker_type == threading.Thread:
@@ -446,8 +488,8 @@ class reader:
         raise RuntimeError(f"Unexpected BigQuery read worker message: {(kind, payload)!r}")
 
     def _next_python(self):
-        if self.actual_worker_count == 0:
-            # No streams were created (empty result set); nothing to yield.
+        if self.workers_done >= self.actual_worker_count:
+            # Empty session or already exhausted; iteration stays exhausted.
             raise StopIteration
         assert self.ipc_exchange is not None
         while True:
@@ -519,9 +561,25 @@ class reader:
 
         logger.debug(f"Time taken: {time.time() - self.t0:.2f}")
 
+    def _discard_queued_results(self):
+        while True:
+            try:
+                kind, payload = self.queue_results.get_nowait()
+            except queue.Empty:
+                return
+            if kind == _QUEUE_RESULT:
+                _discard_result(self.ipc_exchange, payload)
+
     def _exit_python(self, exc_type):
-        for w in self.workers:
-            w.join(timeout=_WORKER_JOIN_TIMEOUT)
+        self.stop_event.set()
+        # Drain while joining: process queue feeder threads must be allowed to
+        # flush their final keys, and bounded producers must be able to cancel.
+        deadline = time.monotonic() + _WORKER_JOIN_TIMEOUT
+        while any(w.is_alive() for w in self.workers) and time.monotonic() < deadline:
+            self._discard_queued_results()
+            for worker in self.workers:
+                worker.join(timeout=0)
+            time.sleep(0.01)
 
         alive_workers = [w for w in self.workers if w.is_alive()]
         for worker in alive_workers:
@@ -533,7 +591,11 @@ class reader:
             if getattr(worker, "terminate", None):
                 worker.join(timeout=_WORKER_JOIN_TIMEOUT)
 
+        self._discard_queued_results()
         still_alive = [w for w in self.workers if w.is_alive()]
+        if self.worker_type == multiprocessing.Process and not still_alive:
+            self.queue_results.close()
+            self.queue_results.join_thread()
         if still_alive:
             message = f"{len(still_alive)} BigQuery read worker(s) did not stop cleanly"
             logger.error(message)

@@ -57,6 +57,17 @@ class SharedMemory(ConcurrencyCompatible):
 
         return f"{name}:{nbytes}"
 
+    def discard(self, key: str) -> None:
+        name, _ = _parse_key(key)
+        try:
+            shm = shared_memory.SharedMemory(name=name)
+        except FileNotFoundError:
+            return
+        try:
+            shm.unlink()
+        finally:
+            shm.close()
+
     def load(self, key: str) -> pa.Table:
         name, nbytes = _parse_key(key)
         shm = shared_memory.SharedMemory(name=name)

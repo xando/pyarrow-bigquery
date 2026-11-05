@@ -232,6 +232,12 @@ with bq.reader(
 
 Thread workers default to `exchange.Memory()`. Other exchanges (`Feather`, `SharedMemory`, …) are available under `pyarrow.bigquery.exchange` for advanced tuning.
 
+Python readers bound their result queue to `max(4, worker_count * 2)` chunks;
+workers may each hold one additional chunk while waiting to enqueue it, plus
+buffers for the current Storage API response. Consumed `Memory` results are
+removed from the exchange. Exiting the context cancels blocked producers and
+discards unread results. This bounds read-ahead by chunk count, not byte size.
+
 `worker_type` / `ipc_exchange` only apply to the Python read engine (the default). See below for the Rust engine, which manages concurrency internally.
 
 ### Read engines (`engine="python"` vs `"rust"`)
