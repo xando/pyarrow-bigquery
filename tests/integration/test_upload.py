@@ -208,10 +208,11 @@ def test_rust_arrow_compression_roundtrips_nested_values(LOCATION, compression):
     assert result.sort_by("id").to_pylist() == table.to_pylist()
 
 
-def test_rust_context_exception_does_not_commit_rows(LOCATION):
+@pytest.mark.parametrize("engine", ["python", "rust"])
+def test_context_exception_does_not_commit_rows(LOCATION, engine):
     table = pa.table({"value": [1, 2]})
     with pytest.raises(ValueError, match="abort upload"):
-        with bq.writer(table.schema, LOCATION, engine="rust") as w:
+        with bq.writer(table.schema, LOCATION, engine=engine) as w:
             w.write_table(table)
             raise ValueError("abort upload")
 
