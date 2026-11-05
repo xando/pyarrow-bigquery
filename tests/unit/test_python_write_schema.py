@@ -1,5 +1,6 @@
 import importlib
 import queue
+import threading
 
 import pyarrow as pa
 import pytest
@@ -12,12 +13,29 @@ SCHEMA = pa.schema([
 
 
 @pytest.fixture
-def python_writer(tmp_path):
-    # Exercise the real enqueue/Feather path without clients or workers.
-    writer = write_mod.writer(SCHEMA, "project.dataset.table", table_create=False)
-    writer.temp_dir = str(tmp_path)
-    writer.queue_results = queue.Queue()
-    return writer
+def python_writer(tmp_path, monkeypatch):
+    # Use the public context lifecycle but pause consumption so tests can inspect
+    # the real enqueue/Feather path without any cloud clients.
+    release = threading.Event()
+
+    def worker(parent, schema, work, status, compression=None, stop_event=None):
+        release.wait(timeout=5)
+        while stop_event is None or not stop_event.is_set():
+            try:
+                if work.get(timeout=0.01) is None:
+                    status.put((write_mod._QUEUE_DONE, None))
+                    return
+            except queue.Empty:
+                continue
+
+    monkeypatch.setattr(write_mod, "_stream_worker", worker)
+    monkeypatch.setattr(write_mod.tempfile, "mkdtemp", lambda: str(tmp_path))
+    with write_mod.writer(SCHEMA, "project.dataset.table", table_create=False,
+                          worker_count=1) as writer:
+        try:
+            yield writer
+        finally:
+            release.set()
 
 
 @pytest.mark.parametrize("method", ["write_table", "write_batch"])
