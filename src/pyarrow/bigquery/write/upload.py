@@ -58,7 +58,9 @@ def _acknowledge(future, expected_offset, stop_event=None):
                 response = future.result(timeout=max(0, min(0.25, deadline - time.monotonic())))
                 break
             except FutureTimeoutError:
-                if time.monotonic() >= deadline:
+                # A completed future may itself contain a timeout exception;
+                # distinguish that failure from our short cancellation poll.
+                if future.done() or time.monotonic() >= deadline:
                     raise
     if response.row_errors:
         raise RuntimeError(f"AppendRows row errors: {response.row_errors}")

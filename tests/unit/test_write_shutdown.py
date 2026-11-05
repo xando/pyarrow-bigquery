@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -224,6 +225,13 @@ def test_caught_serialization_error_still_prevents_commit(offline_writer, monkey
     assert raised.value is error
     assert offline_writer == []
     assert not write_mod.os.path.exists(writer.temp_dir)
+
+
+def test_completed_timeout_failure_is_not_treated_as_a_cancellation_poll():
+    future = Future()
+    future.set_exception(FutureTimeoutError("RPC timed out"))
+    with pytest.raises(FutureTimeoutError, match="RPC timed out"):
+        write_mod.upload._acknowledge(future, 0, stop_event=threading.Event())
 
 
 def test_cancellation_interrupts_unacknowledged_upload(monkeypatch, tmp_path):
