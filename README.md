@@ -182,12 +182,14 @@ ignored. When both options match a column, `cast_column` takes precedence;
 conversion goes directly from the original type to the chosen target.
 
 Both options work on `reader`, `read_query`, and `reader_query`, with both read
-engines. Casts run locally on each chunk using PyArrow's safe casting.
-Unmatched columns keep their types; column order, nulls, and schema metadata are
-preserved. Unsupported conversions, overflow, and precision loss raise an Arrow
-error. A named column absent from the read schema (including one excluded by
-`columns`) raises `KeyError`. Nested types such as lists can be converted by
-specifying the target type of the whole column.
+engines. Casts run locally on each record batch as it is decoded, using
+PyArrow's safe casting, so the original data of a batch is released right after
+its conversion rather than once a whole chunk of `batch_size` rows has been
+collected. Unmatched columns keep their types; column order, nulls, and schema
+metadata are preserved. Unsupported conversions, overflow, and precision loss
+raise an Arrow error. A named column absent from the read schema (including one
+excluded by `columns`) raises `KeyError`. Nested types such as lists can be
+converted by specifying the target type of the whole column.
 
 `reader.schema` reflects the requested types, and empty results retain that
 schema as well.

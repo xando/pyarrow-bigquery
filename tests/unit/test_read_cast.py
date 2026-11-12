@@ -194,3 +194,80 @@ def test_no_cast_preserves_schema_and_values(mock_read, engine, cast_column, cas
         "p.d.t", cast_column=cast_column, cast_type=cast_type, engine=engine, worker_count=1
     )
     assert result.equals(source)
+
+
+def test_rust_engine_releases_each_decoded_batch_once_cast(monkeypatch):
+    """A batch is cast as it arrives and the pending chunk holds none of its decoded memory,
+    neither through a column the cast leaves unchanged nor through the offsets of a list."""
+    rows = 100_000
+    groups = 4
+    schema = pa.schema([("values", pa.list_(pa.int64())), ("flag", pa.bool_())])
+    allocated = []
+
+    class FakePyReader:
+        def __init__(self, *args, **kwargs):
+            self.remaining = groups
+
+        def schema_ipc(self):
+            return schema.serialize()
+
+        def __next__(self):
+            allocated.append(pa.total_allocated_bytes())
+            if not self.remaining:
+                raise StopIteration
+            self.remaining -= 1
+            # Decoded like the Rust reader's batches: every column a view of one allocation
+            batch = pa.record_batch(
+                [pa.repeat(list(range(10)), rows), pa.repeat(True, rows)], schema=schema
+            )
+            return [pa.ipc.read_record_batch(batch.serialize(), schema)]
+
+    monkeypatch.setattr(read_mod, "_bq_table_exists", lambda *args: None)
+    monkeypatch.setattr(read_mod._rust, "PyReader", FakePyReader)
+
+    with read_mod.reader(
+        "p.d.t",
+        engine="rust",
+        batch_size=groups * rows,
+        cast_type={pa.list_(pa.int64()): pa.list_(pa.int8())},
+    ) as stream:
+        chunks = list(stream)
+
+    assert [chunk.num_rows for chunk in chunks] == [groups * rows]
+    assert chunks[0].schema.types == [pa.list_(pa.int8()), pa.bool_()]
+    decoded_batch_bytes = rows * 10 * 8
+    assert max(allocated) - allocated[0] < decoded_batch_bytes
+
+
+def test_python_engine_casts_in_the_worker(mock_read):
+    """The worker hands cast tables to the exchange, not tables the main process still has to cast."""
+
+    class RecordingExchange:
+        thread_compatible = True
+
+        def __init__(self):
+            self.tables = {}
+
+        def store(self, table):
+            key = str(len(self.tables))
+            self.tables[key] = table
+            return key
+
+        def load(self, key):
+            return self.tables[key]
+
+    source = pa.table({"value": pa.array([1, 2, 3], type=pa.int64())})
+    mock_read(source)
+    ipc_exchange = RecordingExchange()
+
+    result = read_mod.read_table(
+        "p.d.t",
+        engine="python",
+        worker_count=1,
+        batch_size=2,
+        ipc_exchange=ipc_exchange,
+        cast_type={pa.int64(): pa.int32()},
+    )
+
+    assert result.to_pydict() == source.to_pydict()
+    assert [table.schema.types for table in ipc_exchange.tables.values()] == [[pa.int32()]] * 2
