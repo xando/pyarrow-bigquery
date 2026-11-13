@@ -194,6 +194,9 @@ converted by specifying the target type of the whole column.
 `reader.schema` reflects the requested types, and empty results retain that
 schema as well.
 
+PyArrow 18 or newer is required. Converted batches own their buffers, including
+unchanged columns and nested offsets, so they do not retain the decoded data.
+
 ### Query location and large results
 
 Pass `location` when the query must run in a specific region. For very large query outputs, materialize into a temporary table and read via the Storage API:

@@ -510,7 +510,10 @@ class reader:
             # released right after its conversion instead of once a whole chunk of
             # batch_size rows has been accumulated and cast.
             if self._cast_schema is not None:
-                batches = [_cast_batch(batch, self._cast_schema) for batch in batches]
+                # Replace entries so the original group does not retain batches
+                # that have already been converted.
+                for index in range(len(batches)):
+                    batches[index] = _cast_batch(batches[index], self._cast_schema)
             self._rust_pending.extend(batches)
             self._rust_pending_rows += sum(batch.num_rows for batch in batches)
 

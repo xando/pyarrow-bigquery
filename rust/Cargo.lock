@@ -1583,7 +1583,7 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "pyarrow_bigquery_rs"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "arrow",
  "bytes",

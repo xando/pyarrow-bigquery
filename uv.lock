@@ -772,7 +772,7 @@ wheels = [
 
 [[package]]
 name = "pyarrow-bigquery"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "." }
 dependencies = [
     { name = "google-cloud-bigquery" },
@@ -796,7 +796,7 @@ dev = [
 requires-dist = [
     { name = "google-cloud-bigquery", specifier = ">=3.10.0,<5" },
     { name = "google-cloud-bigquery-storage", specifier = ">=2.18.0,<3" },
-    { name = "pyarrow" },
+    { name = "pyarrow", specifier = ">=18" },
     { name = "tenacity" },
 ]
 
