@@ -48,6 +48,16 @@ def _queue_error(exc: BaseException):
     return (_QUEUE_ERROR, (type(exc).__name__, str(exc), traceback.format_exc()))
 
 
+def _cast_batch(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
+    # The columns of a decoded batch are views of one allocation (the IPC message, or the
+    # buffers the Rust decoder owns), and the cast keeps sharing every buffer it does not
+    # convert: the columns it leaves unchanged, the offsets and validity bitmaps of nested
+    # columns. Any of those would hold the whole allocation, the data cast out of it
+    # included, for as long as the batch lives, so the cast batch is copied as a whole and
+    # the decoded memory is released as soon as the batch is converted.
+    return batch.cast(schema, safe=True).copy_to(pa.default_cpu_memory_manager())
+
+
 def _close_client_transport(client):
     if not client:
         return
@@ -123,6 +133,7 @@ def _stream_worker(
     batch_size: int,
     queue_results: multiprocessing.Queue | queue.Queue,
     ipc_exchange,
+    cast_schema: pa.Schema | None,
 ):
     read_client = None
     try:
@@ -136,6 +147,11 @@ def _stream_worker(
                     message.arrow_record_batch.serialized_record_batch,
                     table_schema,
                 )
+                # Cast each batch as it is decoded: the decoded bytes of a batch are
+                # released right after its conversion instead of once a whole chunk
+                # of batch_size rows has been accumulated and cast.
+                if cast_schema is not None:
+                    record_batch = _cast_batch(record_batch, cast_schema)
 
                 batches.append(record_batch)
 
@@ -324,6 +340,7 @@ class reader:
                 raise ValueError(f"cast_column column {name!r} is ambiguous in the read schema")
             index = indices[0]
             self.schema = self.schema.set(index, schema.field(index).with_type(target_type))
+        self._cast_schema = None if self.schema.equals(self._source_schema) else self.schema
 
     def _enter_python(self):
         assert isinstance(
@@ -382,6 +399,7 @@ class reader:
                     self.batch_size,
                     self.queue_results,
                     self.ipc_exchange,
+                    self._cast_schema,
                 ),
             )
             if self.worker_type == threading.Thread:
@@ -419,10 +437,8 @@ class reader:
 
     def __next__(self):
         if self.engine == "rust":
-            table = self._next_rust()
-        else:
-            table = self._next_python()
-        return table.cast(self.schema, safe=True) if self.cast_column or self.cast_type else table
+            return self._next_rust()
+        return self._next_python()
 
     # --- python iteration ---
 
@@ -435,6 +451,9 @@ class reader:
 
         if kind == _QUEUE_ERROR:
             error_type, error_message, formatted_traceback = payload
+            arrow_error = getattr(pa, error_type, None)
+            if isinstance(arrow_error, type) and issubclass(arrow_error, pa.ArrowException):
+                raise arrow_error(f"{error_message}\n{formatted_traceback}")
             raise RuntimeError(
                 f"BigQuery read worker failed with {error_type}: {error_message}\n"
                 f"{formatted_traceback}"
@@ -487,6 +506,14 @@ class reader:
             except StopIteration:
                 self._rust_exhausted = True
                 break
+            # Cast each batch as it arrives: the Rust-owned buffers of a batch are
+            # released right after its conversion instead of once a whole chunk of
+            # batch_size rows has been accumulated and cast.
+            if self._cast_schema is not None:
+                # Replace entries so the original group does not retain batches
+                # that have already been converted.
+                for index in range(len(batches)):
+                    batches[index] = _cast_batch(batches[index], self._cast_schema)
             self._rust_pending.extend(batches)
             self._rust_pending_rows += sum(batch.num_rows for batch in batches)
 
@@ -494,12 +521,12 @@ class reader:
             raise StopIteration
 
         if self._rust_exhausted or self._rust_pending_rows <= self.batch_size:
-            table = pa.Table.from_batches(self._rust_pending, schema=self._source_schema)
+            table = pa.Table.from_batches(self._rust_pending, schema=self.schema)
             self._rust_pending = []
             self._rust_pending_rows = 0
             return table
 
-        combined = pa.Table.from_batches(self._rust_pending, schema=self._source_schema)
+        combined = pa.Table.from_batches(self._rust_pending, schema=self.schema)
         head = combined.slice(0, self.batch_size)
         tail = combined.slice(self.batch_size)
         self._rust_pending = tail.to_batches()
